@@ -47,6 +47,11 @@ return [
         // enrolled courses (our system only stores email, not Moodle's userid).
         'api/moodle/users/enrolled-courses'               => [\App\Controllers\MoodleController::class, 'enrolledCoursesByEmail'],         
 
+        // Exam Permit — reads all 4 grading-period checkbox custom
+        // profile fields in one call (core_user_get_users_by_field
+        // already returns every customfield on the user record).
+        'api/moodle/users/exam-permit-status'             => [\App\Controllers\MoodleController::class, 'examPermitStatusByEmail'],
+
         // ── Accounts module ──
         // Reference/lookup endpoints aliased to EnrollmentController —
         // tblFees, tblSections, tblPrograms, tblStudents are shared,
@@ -194,6 +199,12 @@ return [
         // MoodleController::updateEnrollmentStatusByShortnameAndEmail() for
         // the caveat this implies.
         'api/moodle/courses/enrollment-status-by-email' => [\App\Controllers\MoodleController::class, 'updateEnrollmentStatusByShortnameAndEmail'],
+
+        // Exam Permit — writes exactly ONE grading period's checkbox
+        // custom profile field per call (core_user_update_users applies
+        // customfields as a partial update, so this never touches the
+        // other three periods). Body: { email, period, active }.
+        'api/moodle/users/exam-permit-status' => [\App\Controllers\MoodleController::class, 'updateExamPermitStatusByEmail'],
 		
         'api/import'                 => [\App\Controllers\ImportController::class,       'handle'],
  

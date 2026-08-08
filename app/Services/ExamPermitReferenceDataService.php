@@ -34,7 +34,8 @@ class ExamPermitReferenceDataService
      * @return array<int, array{studentNumber:string, fullName:string,
      *   lastName:string, firstName:string, registrationNumber:string,
      *   programID:string, programCode:string, yearLevel:string,
-     *   sectionID:string, sectionName:string, classCode:string}>
+     *   sectionID:string, sectionName:string, classCode:string,
+     *   moodleEmail:string}>
      */
     public function getTermStudentRoster(string $academicYear, string $semester): array
     {
@@ -43,11 +44,13 @@ class ExamPermitReferenceDataService
             SELECT r.RegistrationNumber, r.studentNumber, r.programID, r.yearLevel, r.sectionID,
                    r.dateCreated,
                    s.lastName, s.firstName, s.middleName, s.middleInitial, s.nameExtension,
-                   p.programCode, sec.sectionName
+                   p.programCode, sec.sectionName,
+                   la.moodleEmail
             FROM tblRegistrations r
             INNER JOIN tblStudents s ON s.studentNumber = r.studentNumber
             LEFT JOIN tblPrograms p   ON p.programID   = r.programID
             LEFT JOIN tblSections sec ON sec.sectionID = r.sectionID
+            LEFT JOIN tblLmsAccounts la ON la.studentNumber = r.studentNumber
             WHERE r.academicYear = :academicYear AND r.semester = :semester
             ORDER BY r.dateCreated DESC
         ");
@@ -78,6 +81,12 @@ class ExamPermitReferenceDataService
                 'sectionID'          => $sectionID,
                 'sectionName'        => (string)$sectionName,
                 'classCode'          => $this->_buildClassCode((string)$programCode, $yearLevel, (string)$sectionName),
+                // From tblLmsAccounts (1:1 on studentNumber, LEFT JOINed
+                // above) — blank if the student has no LMS account row yet.
+                // Used client-side to key the Exam Permit Moodle
+                // custom-profile-field check (see MoodleController's
+                // examPermitStatusByEmail()).
+                'moodleEmail'        => (string)($row['moodleEmail'] ?? ''),
             ];
         }
 
@@ -116,11 +125,13 @@ class ExamPermitReferenceDataService
         $regStmt = $db->prepare("
             SELECT r.RegistrationNumber, r.programID, r.yearLevel, r.sectionID,
                    s.studentNumber, s.lastName, s.firstName, s.middleName, s.middleInitial, s.nameExtension,
-                   p.programCode, sec.sectionName
+                   p.programCode, sec.sectionName,
+                   la.moodleEmail
             FROM tblRegistrations r
             INNER JOIN tblStudents s ON s.studentNumber = r.studentNumber
             LEFT JOIN tblPrograms p   ON p.programID   = r.programID
             LEFT JOIN tblSections sec ON sec.sectionID = r.sectionID
+            LEFT JOIN tblLmsAccounts la ON la.studentNumber = r.studentNumber
             WHERE r.studentNumber = :sn AND r.academicYear = :ay AND r.semester = :sem
             ORDER BY r.dateCreated DESC
             LIMIT 1
@@ -146,6 +157,9 @@ class ExamPermitReferenceDataService
             'programCode'        => (string)$programCode,
             'yearLevel'          => $yearLevel !== '' ? $yearLevel : '(No Year Level)',
             'sectionName'        => (string)$sectionName,
+            // See getTermStudentRoster()'s matching field for the join
+            // rationale/consumer.
+            'moodleEmail'        => (string)($reg['moodleEmail'] ?? ''),
         ];
 
         // Subjects: ENROLLED only, joined to their offering's teacher/class,

@@ -54,7 +54,30 @@ class MoodleController
     private const WSFUNCTION_COURSE_GROUPS    = 'core_group_get_course_groups';
     private const WSFUNCTION_CREATE_GROUPS    = 'core_group_create_groups';
     private const WSFUNCTION_ADD_GROUP_MEMBER = 'core_group_add_group_members';
-	
+
+    // Exam Permit (§ new) — one checkbox custom user profile field per
+    // grading period, written via core_user_update_users. No separate
+    // "read" WS function exists — customfields ride along on every
+    // core_user_get_users_by_field response, so the read side reuses
+    // WSFUNCTION_RESOLVE_USER instead of a dedicated constant.
+    private const WSFUNCTION_UPDATE_USER = 'core_user_update_users';
+
+    // Exam Permit — one checkbox custom user profile field per grading
+    // period (plan §0/§3.1). Keys match
+    // ExamPermitReferenceDataService::VALID_PERIODS exactly so a period
+    // string validated/echoed there round-trips unchanged here —
+    // duplicated rather than shared since MoodleController has no
+    // dependency on that service (same deliberate-duplication rationale
+    // as ExamPermitReferenceDataService::_buildClassCode()'s own doc
+    // comment). No env var needed now that the mapping is a fixed
+    // 4-entry table rather than a single configurable shortname.
+    private const EXAM_PERMIT_FIELD_BY_PERIOD = [
+        'PRELIM'     => 'PLExamPermit',
+        'MIDTERM'    => 'MTExamPermit',
+        'SEMIFINALS' => 'SFExamPermit',
+        'FINALS'     => 'FExamPermit',
+    ];
+
 
     // Placeholder timeouts per plan §4.4/§8.3 — tune once real course
     // sizes are known. core_enrol_get_enrolled_users is explicitly called
@@ -588,7 +611,128 @@ class MoodleController
             $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error updating the enrollment status.');
         }
     }
-	
+
+    // ==================================================================
+    // 4.9 examPermitStatusByEmail() — GET /api/moodle/users/exam-permit-status?email=
+    // Returns ALL FOUR periods in one response — see
+    // _resolveUserExamPermitsCore()'s doc comment below for why a single
+    // core_user_get_users_by_field call already carries every
+    // customfield, so there's no per-period read variant.
+    // ==================================================================
+    public function examPermitStatusByEmail(): void
+    {
+        try {
+            $email = isset($_GET['email']) ? trim((string) $_GET['email']) : '';
+            if ($email === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'email is required.');
+                return;
+            }
+
+            $core = $this->_resolveUserExamPermitsCore($email);
+
+            switch ($core['status']) {
+                case 'found':
+                    $this->_respond(200, [
+                        'ok'          => true,
+                        'found'       => true,
+                        'userId'      => $core['userId'],
+                        'examPermits' => $core['examPermits'],
+                    ]);
+                    return;
+                case 'not_found':
+                    $this->_respond(200, [
+                        'ok'          => true,
+                        'found'       => false,
+                        'userId'      => null,
+                        'examPermits' => null,
+                    ]);
+                    return;
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $core['message']);
+                    return;
+                case 'unavailable':
+                default:
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $core['message']);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error reading Exam Permit status.');
+        }
+    }
+
+    // ==================================================================
+    // 4.10 updateExamPermitStatusByEmail() — POST /api/moodle/users/exam-permit-status
+    // Body: { email, period: 'PRELIM'|'MIDTERM'|'SEMIFINALS'|'FINALS', active: true|false }
+    //
+    // Writes exactly ONE period's field per call — see
+    // _setUserExamPermitCore()'s doc comment for why this is a genuine
+    // partial update, unlike updateEnrollmentStatusByShortnameAndEmail()'s
+    // enrol-fresh-if-missing caveat immediately above; this endpoint has
+    // no equivalent caveat since core_user_update_users only ever touches
+    // the customfields explicitly sent.
+    // ==================================================================
+    public function updateExamPermitStatusByEmail(): void
+    {
+        try {
+            $input  = json_decode(file_get_contents('php://input'), true) ?? [];
+            $email  = isset($input['email']) ? trim((string) $input['email']) : '';
+            $period = isset($input['period']) ? strtoupper(trim((string) $input['period'])) : '';
+            $active = $input['active'] ?? null;
+
+            if ($email === '' || !isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period]) || !is_bool($active)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'email, a valid period (PRELIM/MIDTERM/SEMIFINALS/FINALS), and a boolean active are required.');
+                return;
+            }
+
+            // Only userId is needed to write — cheaper than
+            // _resolveUserExamPermitsCore(), which also parses all four
+            // customfields we don't need here.
+            $resolved = $this->_resolveUserIdCore($email);
+            if ($resolved['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $resolved['message']);
+                return;
+            }
+            if ($resolved['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $resolved['message']);
+                return;
+            }
+            if ($resolved['status'] === 'not_found') {
+                $this->_respond(200, ['ok' => true, 'updated' => false, 'reason' => 'USER_NOT_FOUND']);
+                return;
+            }
+
+            $update = $this->_setUserExamPermitCore($resolved['userId'], $period, $active);
+
+            switch ($update['status']) {
+                case 'invalid_period': // defensive only — already validated above
+                case 'invalid':
+                    $this->_fail(422, 'EXAM_PERMIT_UPDATE_INVALID', $update['message']);
+                    return;
+                case 'forbidden':
+                    $this->_fail(502, 'MOODLE_FORBIDDEN', $update['message']);
+                    return;
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $update['message']);
+                    return;
+                case 'unavailable':
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $update['message']);
+                    return;
+                case 'ok':
+                default:
+                    $this->_respond(200, [
+                        'ok'      => true,
+                        'updated' => true,
+                        'userId'  => $resolved['userId'],
+                        'period'  => $period,
+                        'active'  => $active,
+                    ]);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error updating Exam Permit status.');
+        }
+    }
+
 	// ==================================================================
     // Private cores — one per Moodle operation, both routed through the
     // single _callMoodleWs() transport helper (§4.4). Public methods
@@ -759,6 +903,130 @@ class MoodleController
         }, $rawCourses);
 
         return ['status' => 'ok', 'courses' => $courses];
+    }
+
+    /**
+     * Resolves a Moodle user by email and extracts ALL FOUR Exam Permit
+     * custom fields in one WS call — core_user_get_users_by_field already
+     * returns every customfield on the user record regardless of which
+     * one the caller cares about, so this reads all four at once rather
+     * than making a caller specify a period. Sibling of
+     * _resolveUserIdCore() rather than a shared refactor of it, matching
+     * this controller's existing "one core per Moodle operation"
+     * convention — callers that only need userId keep using
+     * _resolveUserIdCore(); callers of this method pay one extra
+     * round trip for the richer return shape.
+     *
+     * @return array{status:string,userId?:int,examPermits?:array<string,array{fieldConfigured:bool,active:?bool,rawValue:?string}>,message?:string}
+     */
+    private function _resolveUserExamPermitsCore(string $email): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_RESOLVE_USER, [
+            'field'  => 'email',
+            'values' => [$email],
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            // Same rationale as _resolveUserIdCore(): no documented
+            // "not found" exception for this WS function — empty array
+            // is its not-found signal instead.
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — a bare JSON array of user objects.
+        $users = is_array($result['data']) ? $result['data'] : [];
+        if (empty($users)) {
+            return ['status' => 'not_found'];
+        }
+
+        $user = $users[0];
+        $customFields = is_array($user['customfields'] ?? null) ? $user['customfields'] : [];
+
+        $rawByShortname = [];
+        foreach ($customFields as $cf) {
+            if (isset($cf['shortname'])) {
+                $rawByShortname[$cf['shortname']] = isset($cf['value']) ? (string) $cf['value'] : null;
+            }
+        }
+
+        $examPermits = [];
+        foreach (self::EXAM_PERMIT_FIELD_BY_PERIOD as $period => $shortname) {
+            $configured = array_key_exists($shortname, $rawByShortname);
+            $raw = $configured ? $rawByShortname[$shortname] : null;
+            $examPermits[$period] = [
+                'fieldConfigured' => $configured,
+                // Checkbox custom fields store '1'/'0' as strings (plan
+                // §Phase 0, decision 2) — anything else (missing field,
+                // unexpected value) resolves to null rather than a guessed
+                // boolean.
+                'active'          => $configured ? ($raw === '1') : null,
+                'rawValue'        => $raw,
+            ];
+        }
+
+        return ['status' => 'found', 'userId' => (int) $user['id'], 'examPermits' => $examPermits];
+    }
+
+    /**
+     * Sets ONE period's Exam Permit custom field via
+     * core_user_update_users. Sends ONLY the single {type, value} pair
+     * for the requested period's shortname — Moodle's update_users
+     * applies customfields as a partial update (fields omitted from the
+     * request are left untouched), so Activating/Deactivating PRELIM
+     * never touches MIDTERM/SEMIFINALS/FINALS. (Verified against the
+     * real install per plan Phase 7, step 3.)
+     *
+     * @return array{status:string,message?:string}
+     */
+    private function _setUserExamPermitCore(int $userId, string $period, bool $active): array
+    {
+        if (!isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period])) {
+            return ['status' => 'invalid_period', 'message' => 'Unknown exam permit period: ' . $period];
+        }
+        $shortname = self::EXAM_PERMIT_FIELD_BY_PERIOD[$period];
+
+        $result = $this->_callMoodleWs(self::WSFUNCTION_UPDATE_USER, [
+            'users' => [
+                [
+                    'id'           => $userId,
+                    'customfields' => [
+                        ['type' => $shortname, 'value' => $active ? '1' : '0'],
+                    ],
+                ],
+            ],
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            $errorcode = $result['data']['errorcode'] ?? null;
+            if ($errorcode === 'invalidparameter') {
+                return [
+                    'status'  => 'invalid',
+                    'message' => $result['data']['message'] ?? 'Invalid userId.',
+                ];
+            }
+            if (in_array($errorcode, ['nopermissions', 'required_capability_exception'], true)) {
+                return [
+                    'status'  => 'forbidden',
+                    'message' => $result['data']['message'] ?? 'Moodle denied the update.',
+                ];
+            }
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — core_user_update_users returns null.
+        return ['status' => 'ok'];
     }
 
     /**
