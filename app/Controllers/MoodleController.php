@@ -1,0 +1,1169 @@
+<?php
+
+namespace App\Controllers;
+
+/**
+ * MoodleController
+ *
+ * Top-level, module-agnostic controller (same tier as LmsController) that
+ * answers "what does Moodle say about this shortname / this course id?" in
+ * plain, undecorated data. It knows nothing about Subject Loading, rosters,
+ * CSV exports, or what "blocked"/"eligible" means — that policy lives in
+ * the caller (subjectLoading.html's JS today; StudentSubjectEnrollmentController
+ * later, if centralized server-side).
+ *
+ * Every public method: wrapped in try/catch, returns the shared
+ * { ok: bool, ... } envelope, and sets its HTTP status explicitly via
+ * _respond()/_fail().
+ *
+ * Config (see plan §6 / §8.1): read from environment variables, never
+ * hardcoded. Missing config fails loudly (500 MOODLE_CONFIG_ERROR) rather
+ * than silently hitting Moodle with an empty token.
+ *
+ *   MOODLE_WSTOKEN          - Moodle web service token
+ *   MOODLE_BASE_URL         - e.g. https://lms.tsatinc.edu.ph/webservice/rest/server.php
+ *   MOODLE_STUDENT_ROLE_ID  - optional; roleid used by enrollUser()/
+ *                             enrollUserByShortnameAndEmail() when no
+ *                             roleId is given in the request. Defaults to
+ *                             5 (stock Moodle "Student" role) if unset —
+ *                             verify against Site Administration → Users →
+ *                             Permissions → Define roles on this instance,
+ *                             since role ids are data, not a protocol
+ *                             constant, and are not guaranteed to be 5 on
+ *                             a customized install.
+ *
+ * SECURITY NOTE (plan §2.3): the wstoken value that shipped in
+ * Moodle_REST_API.txt was shared in plaintext and must be treated as
+ * compromised — rotate it in Moodle's admin panel and only ever put the
+ * new value in the environment, never in source control.
+ */
+class MoodleController
+{
+    private const WSFUNCTION_RESOLVE_COURSE  = 'core_course_get_courses_by_field';
+    private const WSFUNCTION_ENROLLED_USERS  = 'core_enrol_get_enrolled_users';
+    private const WSFUNCTION_RESOLVE_USER    = 'core_user_get_users_by_field';
+    private const WSFUNCTION_USER_COURSES    = 'core_enrol_get_users_courses';
+
+    // Student enrollment (§ new) — enrol_manual_enrol_users is the standard
+    // Manual-enrolment-plugin WS function. Returns null on success.
+    private const WSFUNCTION_ENROL_USER      = 'enrol_manual_enrol_users';
+
+    // Course groups (§ new) — find-or-create-then-add pattern, mirroring the
+    // resolve-then-act convention already used for courses/users elsewhere
+    // in this controller rather than relying on a duplicate-name exception.
+    private const WSFUNCTION_COURSE_GROUPS    = 'core_group_get_course_groups';
+    private const WSFUNCTION_CREATE_GROUPS    = 'core_group_create_groups';
+    private const WSFUNCTION_ADD_GROUP_MEMBER = 'core_group_add_group_members';
+	
+
+    // Placeholder timeouts per plan §4.4/§8.3 — tune once real course
+    // sizes are known. core_enrol_get_enrolled_users is explicitly called
+    // out in the source material as slow on large courses.
+    private const CONNECT_TIMEOUT_SECONDS = 15;
+    private const TOTAL_TIMEOUT_SECONDS   = 25;
+
+    // ==================================================================
+    // 4.1 resolveCourseId() — GET /api/moodle/courses/resolve?shortname=
+    // ==================================================================
+    public function resolveCourseId(): void
+    {
+        try {
+            $shortname = isset($_GET['shortname']) ? trim((string) $_GET['shortname']) : '';
+            if ($shortname === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'shortname is required.');
+                return;
+            }
+
+            $core = $this->_resolveCourseCore($shortname);
+
+            switch ($core['status']) {
+                case 'found':
+                    $this->_respond(200, [
+                        'ok'       => true,
+                        'found'    => true,
+                        'courseId' => $core['courseId'],
+                        'course'   => $core['course'],
+                    ]);
+                    return;
+
+                case 'not_found':
+                    $this->_respond(200, [
+                        'ok'       => true,
+                        'found'    => false,
+                        'courseId' => null,
+                    ]);
+                    return;
+
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $core['message']);
+                    return;
+
+                case 'unavailable':
+                default:
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $core['message']);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error resolving the Moodle course.');
+        }
+    }
+
+    // ==================================================================
+    // 4.2 enrolledUsers() — GET /api/moodle/courses/enrolled-users?courseId=
+    // ==================================================================
+    public function enrolledUsers(): void
+    {
+        try {
+            $courseIdRaw = $_GET['courseId'] ?? null;
+            if ($courseIdRaw === null || $courseIdRaw === '' || !ctype_digit((string) $courseIdRaw)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'courseId is required and must be an integer.');
+                return;
+            }
+            $courseId = (int) $courseIdRaw;
+
+            $core = $this->_enrolledUsersCore($courseId);
+
+            switch ($core['status']) {
+                case 'ok':
+                    $this->_respond(200, [
+                        'ok'    => true,
+                        'users' => $core['users'],
+                    ]);
+                    return;
+
+                case 'course_not_found':
+                    // Structured non-error (HTTP 200) — Moodle's own
+                    // dml_missing_record_exception for an unknown course id.
+                    $this->_respond(200, [
+                        'ok'    => false,
+                        'error' => ['code' => 'COURSE_NOT_FOUND', 'message' => $core['message']],
+                    ]);
+                    return;
+
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $core['message']);
+                    return;
+
+                case 'unavailable':
+                default:
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $core['message']);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error fetching enrolled users.');
+        }
+    }
+
+    // ==================================================================
+    // 4.3 enrolledUsersByShortname() — convenience composition only.
+    // GET /api/moodle/courses/enrolled-users-by-shortname?shortname=
+    //
+    // Composes _resolveCourseCore() + _enrolledUsersCore() — the exact
+    // same private core methods the two endpoints above use — so no
+    // Moodle-calling logic is duplicated here. This is the endpoint the
+    // roster modal actually calls (plan §7).
+    // ==================================================================
+    public function enrolledUsersByShortname(): void
+    {
+        try {
+            $shortname = isset($_GET['shortname']) ? trim((string) $_GET['shortname']) : '';
+            if ($shortname === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'shortname is required.');
+                return;
+            }
+
+            $resolved = $this->_resolveCourseCore($shortname);
+
+            if ($resolved['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $resolved['message']);
+                return;
+            }
+            if ($resolved['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $resolved['message']);
+                return;
+            }
+            if ($resolved['status'] === 'not_found') {
+                $this->_respond(200, [
+                    'ok'       => true,
+                    'found'    => false,
+                    'courseId' => null,
+                    'users'    => [],
+                ]);
+                return;
+            }
+
+            // $resolved['status'] === 'found' from here on.
+            $courseId = $resolved['courseId'];
+            $users = $this->_enrolledUsersCore($courseId);
+
+            switch ($users['status']) {
+                case 'ok':
+                    $this->_respond(200, [
+                        'ok'       => true,
+                        'found'    => true,
+                        'courseId' => $courseId,
+                        'users'    => $users['users'],
+                    ]);
+                    return;
+
+                case 'course_not_found':
+                    // The shortname resolved to a course id a moment ago but
+                    // Moodle no longer recognizes it (e.g. deleted between the
+                    // two calls) — treat the composed result as "no course"
+                    // rather than surfacing a confusing partial state.
+                    $this->_respond(200, [
+                        'ok'       => true,
+                        'found'    => false,
+                        'courseId' => null,
+                        'users'    => [],
+                    ]);
+                    return;
+
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $users['message']);
+                    return;
+
+                case 'unavailable':
+                default:
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $users['message']);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error fetching the Moodle roster.');
+        }
+    }
+
+    // ==================================================================
+    // 4.5 enrolledCoursesByEmail() — convenience composition only.
+    // GET /api/moodle/users/enrolled-courses?email=
+    //
+    // Our external site only stores student email/username, never Moodle's
+    // internal userid, so this composes _resolveUserIdCore() +
+    // _enrolledCoursesCore() the same way enrolledUsersByShortname() composes
+    // course resolution + roster lookup. No Moodle-calling logic is
+    // duplicated here.
+    // ==================================================================
+    public function enrolledCoursesByEmail(): void
+    {
+        try {
+            $email = isset($_GET['email']) ? trim((string) $_GET['email']) : '';
+            if ($email === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'email is required.');
+                return;
+            }
+
+            $resolved = $this->_resolveUserIdCore($email);
+
+            if ($resolved['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $resolved['message']);
+                return;
+            }
+            if ($resolved['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $resolved['message']);
+                return;
+            }
+            if ($resolved['status'] === 'not_found') {
+                $this->_respond(200, [
+                    'ok'      => true,
+                    'found'   => false,
+                    'userId'  => null,
+                    'courses' => [],
+                ]);
+                return;
+            }
+
+            // $resolved['status'] === 'found' from here on.
+            $userId = $resolved['userId'];
+            $courses = $this->_enrolledCoursesCore($userId);
+
+            switch ($courses['status']) {
+                case 'ok':
+                    $this->_respond(200, [
+                        'ok'      => true,
+                        'found'   => true,
+                        'userId'  => $userId,
+                        'courses' => $courses['courses'],
+                    ]);
+                    return;
+
+                case 'user_not_found':
+                    // The email resolved to a userid a moment ago but Moodle
+                    // no longer recognizes it (e.g. deleted between the two
+                    // calls) — treat the composed result as "no user" rather
+                    // than surfacing a confusing partial state, matching
+                    // enrolledUsersByShortname()'s course_not_found handling.
+                    $this->_respond(200, [
+                        'ok'      => true,
+                        'found'   => false,
+                        'userId'  => null,
+                        'courses' => [],
+                    ]);
+                    return;
+
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $courses['message']);
+                    return;
+
+                case 'unavailable':
+                default:
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $courses['message']);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error fetching enrolled courses.');
+        }
+    }
+
+    // ==================================================================
+    // 4.6 enrollUser() — POST /api/moodle/courses/enroll-user
+    //
+    // Enrolls a Moodle user (by internal userid) into a course (by
+    // internal courseid) via the Manual enrolment plugin. Optionally also
+    // ensures the user is a member of a named course group, creating the
+    // group if it doesn't already exist. Group assignment is best-effort:
+    // if enrollment succeeds but the group step fails, this still returns
+    // 200 with enrolled:true and a group.status of "failed" rather than
+    // masking a real enrollment behind a group-only problem.
+    // ==================================================================
+    public function enrollUser(): void
+    {
+        try {
+            $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+            $courseId  = $input['courseId'] ?? null;
+            $userId    = $input['moodleUserId'] ?? null;
+            $roleId    = $input['roleId'] ?? null;
+            $groupName = isset($input['groupName']) ? trim((string) $input['groupName']) : null;
+
+            if (!ctype_digit((string) $courseId) || !ctype_digit((string) $userId)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'courseId and moodleUserId are required integers.');
+                return;
+            }
+            if ($roleId !== null && !ctype_digit((string) $roleId)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'roleId, if provided, must be an integer.');
+                return;
+            }
+            if ($groupName === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'groupName, if provided, must not be empty.');
+                return;
+            }
+
+            $courseId = (int) $courseId;
+            $userId   = (int) $userId;
+
+            $enrol = $this->_enrolUserCore($courseId, $userId, $roleId !== null ? (int) $roleId : null);
+
+            switch ($enrol['status']) {
+                case 'invalid':
+                    $this->_fail(422, 'ENROLLMENT_INVALID', $enrol['message']);
+                    return;
+                case 'forbidden':
+                    $this->_fail(502, 'MOODLE_FORBIDDEN', $enrol['message']);
+                    return;
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $enrol['message']);
+                    return;
+                case 'unavailable':
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $enrol['message']);
+                    return;
+                case 'ok':
+                default:
+                    break; // fall through to optional group handling / response
+            }
+
+            $response = ['ok' => true, 'enrolled' => true];
+
+            if ($groupName !== null) {
+                $response['group'] = $this->_handleGroupAssignment($courseId, $userId, $groupName);
+            }
+
+            $this->_respond(200, $response);
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error enrolling the user.');
+        }
+    }
+
+    // ==================================================================
+    // 4.7 enrollUserByShortnameAndEmail() — convenience composition only.
+    // POST /api/moodle/courses/enroll-user-by-email
+    //
+    // Composes _resolveCourseCore() + _resolveUserIdCore() + the same
+    // _enrolUserCore() enrollUser() uses — no Moodle-calling logic is
+    // duplicated here, matching the enrolledUsersByShortname() /
+    // enrolledCoursesByEmail() convenience-composition pattern. Our
+    // external site only stores email, never Moodle's internal userid.
+    // ==================================================================
+    public function enrollUserByShortnameAndEmail(): void
+    {
+        try {
+            $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+            $shortname = isset($input['shortname']) ? trim((string) $input['shortname']) : '';
+            $email     = isset($input['email']) ? trim((string) $input['email']) : '';
+            $roleId    = $input['roleId'] ?? null;
+            $groupName = isset($input['groupName']) ? trim((string) $input['groupName']) : null;
+
+            if ($shortname === '' || $email === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'shortname and email are required.');
+                return;
+            }
+            if ($roleId !== null && !ctype_digit((string) $roleId)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'roleId, if provided, must be an integer.');
+                return;
+            }
+            if ($groupName === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'groupName, if provided, must not be empty.');
+                return;
+            }
+
+            $course = $this->_resolveCourseCore($shortname);
+            if ($course['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $course['message']);
+                return;
+            }
+            if ($course['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $course['message']);
+                return;
+            }
+            if ($course['status'] === 'not_found') {
+                $this->_respond(200, ['ok' => true, 'enrolled' => false, 'reason' => 'COURSE_NOT_FOUND']);
+                return;
+            }
+
+            $user = $this->_resolveUserIdCore($email);
+            if ($user['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $user['message']);
+                return;
+            }
+            if ($user['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $user['message']);
+                return;
+            }
+            if ($user['status'] === 'not_found') {
+                $this->_respond(200, ['ok' => true, 'enrolled' => false, 'reason' => 'USER_NOT_FOUND']);
+                return;
+            }
+
+            // Both resolved from here on.
+            $courseId = $course['courseId'];
+            $userId   = $user['userId'];
+
+            $enrol = $this->_enrolUserCore($courseId, $userId, $roleId !== null ? (int) $roleId : null);
+
+            switch ($enrol['status']) {
+                case 'invalid':
+                    $this->_fail(422, 'ENROLLMENT_INVALID', $enrol['message']);
+                    return;
+                case 'forbidden':
+                    $this->_fail(502, 'MOODLE_FORBIDDEN', $enrol['message']);
+                    return;
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $enrol['message']);
+                    return;
+                case 'unavailable':
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $enrol['message']);
+                    return;
+                case 'ok':
+                default:
+                    break; // fall through to optional group handling / response
+            }
+
+            $response = [
+                'ok'       => true,
+                'enrolled' => true,
+                'courseId' => $courseId,
+                'userId'   => $userId,
+            ];
+
+            if ($groupName !== null) {
+                $response['group'] = $this->_handleGroupAssignment($courseId, $userId, $groupName);
+            }
+
+            $this->_respond(200, $response);
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error enrolling the user.');
+        }
+    }
+	
+	// ==================================================================
+    // 4.8 updateEnrollmentStatusByShortnameAndEmail() — convenience
+    // composition only. POST /api/moodle/courses/enrollment-status-by-email
+    //
+    // Composes _resolveCourseCore() + _resolveUserIdCore() + the new
+    // _updateEnrolmentStatusCore() — no Moodle-calling logic is duplicated
+    // here, matching enrollUserByShortnameAndEmail()'s own composition
+    // pattern immediately above.
+    //
+    // CAUTION: if the student wasn't already enrolled in this course,
+    // this ENROLLS them fresh at the requested status rather than
+    // failing — see _updateEnrolmentStatusCore()'s doc comment above.
+    // Callers that must guarantee "only ever touch an existing enrolment"
+    // should check enrolledUsersByShortname()/enrolledCoursesByEmail()
+    // first.
+    // ==================================================================
+    public function updateEnrollmentStatusByShortnameAndEmail(): void
+    {
+        try {
+            $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+            $shortname = isset($input['shortname']) ? trim((string) $input['shortname']) : '';
+            $email     = isset($input['email']) ? trim((string) $input['email']) : '';
+            $status    = isset($input['status']) ? strtoupper(trim((string) $input['status'])) : '';
+
+            if ($shortname === '' || $email === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'shortname and email are required.');
+                return;
+            }
+            if (!in_array($status, ['ACTIVE', 'SUSPENDED'], true)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'status must be either ACTIVE or SUSPENDED.');
+                return;
+            }
+
+            $course = $this->_resolveCourseCore($shortname);
+            if ($course['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $course['message']);
+                return;
+            }
+            if ($course['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $course['message']);
+                return;
+            }
+            if ($course['status'] === 'not_found') {
+                $this->_respond(200, ['ok' => true, 'updated' => false, 'reason' => 'COURSE_NOT_FOUND']);
+                return;
+            }
+
+            $user = $this->_resolveUserIdCore($email);
+            if ($user['status'] === 'timeout') {
+                $this->_fail(504, 'MOODLE_TIMEOUT', $user['message']);
+                return;
+            }
+            if ($user['status'] === 'unavailable') {
+                $this->_fail(502, 'MOODLE_UNAVAILABLE', $user['message']);
+                return;
+            }
+            if ($user['status'] === 'not_found') {
+                $this->_respond(200, ['ok' => true, 'updated' => false, 'reason' => 'USER_NOT_FOUND']);
+                return;
+            }
+
+            // Both resolved from here on.
+            $courseId = $course['courseId'];
+            $userId   = $user['userId'];
+
+            // Moodle's own internal Enrolment API status codes:
+            // 0 = ENROL_USER_ACTIVE, 1 = ENROL_USER_SUSPENDED. Hardcoded
+            // here for the same reason FORMAT_HTML (1) is hardcoded in
+            // _createGroupCore() — this app talks to Moodle over HTTP
+            // only and never loads Moodle's own PHP constants.
+            $moodleStatus = $status === 'SUSPENDED' ? 1 : 0;
+
+            $update = $this->_updateEnrolmentStatusCore($courseId, $userId, $moodleStatus);
+
+            switch ($update['status']) {
+                case 'invalid':
+                    $this->_fail(422, 'ENROLLMENT_INVALID', $update['message']);
+                    return;
+                case 'forbidden':
+                    $this->_fail(502, 'MOODLE_FORBIDDEN', $update['message']);
+                    return;
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $update['message']);
+                    return;
+                case 'unavailable':
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $update['message']);
+                    return;
+                case 'ok':
+                default:
+                    $this->_respond(200, [
+                        'ok'       => true,
+                        'updated'  => true,
+                        'courseId' => $courseId,
+                        'userId'   => $userId,
+                        'status'   => $status,
+                    ]);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error updating the enrollment status.');
+        }
+    }
+	
+	// ==================================================================
+    // Private cores — one per Moodle operation, both routed through the
+    // single _callMoodleWs() transport helper (§4.4). Public methods
+    // above only translate these normalized results into HTTP responses;
+    // no duplicate error-shape detection lives in more than one place.
+    // ==================================================================
+
+    /**
+     * @return array{status:string,courseId?:int,course?:array,message?:string}
+     */
+    private function _resolveCourseCore(string $shortname): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_RESOLVE_COURSE, [
+            'field' => 'shortname',
+            'value' => $shortname,
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            // core_course_get_courses_by_field doesn't document a "not
+            // found" exception (empty courses[] is its not-found signal
+            // instead) — any exception here is an unexpected Moodle-side
+            // condition, treated as unavailable rather than guessed at.
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success'
+        $courses = $result['data']['courses'] ?? [];
+        if (empty($courses)) {
+            return ['status' => 'not_found'];
+        }
+
+        $course = $courses[0];
+        return [
+            'status'   => 'found',
+            'courseId' => (int) $course['id'],
+            'course'   => [
+                'fullname'     => $course['fullname'] ?? null,
+                'shortname'    => $course['shortname'] ?? null,
+                'categoryname' => $course['categoryname'] ?? null,
+            ],
+        ];
+    }
+
+    /**
+     * @return array{status:string,users?:array,message?:string}
+     */
+    private function _enrolledUsersCore(int $courseId): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_ENROLLED_USERS, [
+            'options' => [
+                ['name' => 'userfields', 'value' => 'id,username,fullname,email'],
+            ],
+            'courseid' => $courseId,
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            if (($result['data']['errorcode'] ?? null) === 'invalidrecord') {
+                return [
+                    'status'  => 'course_not_found',
+                    'message' => $result['data']['message'] ?? 'Moodle course not found.',
+                ];
+            }
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — a bare JSON array of user objects.
+        $rawUsers = is_array($result['data']) ? $result['data'] : [];
+        $users = array_map(function ($u) {
+            return [
+                'moodleUserId' => $u['id'] ?? null,
+                'username'     => $u['username'] ?? null,
+                'fullname'     => $u['fullname'] ?? null,
+                // Matched on explicitly (plan §2.2) — email is what we
+                // already store/compare in tblLmsAccounts.moodleEmail;
+                // username happening to equal email in this Moodle
+                // instance is an implementation detail, not a guarantee.
+                'email'        => $u['email'] ?? null,
+            ];
+        }, $rawUsers);
+
+        return ['status' => 'ok', 'users' => $users];
+    }
+	
+	/**
+     * @return array{status:string,userId?:int,message?:string}
+     */
+    private function _resolveUserIdCore(string $emailOrUsername): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_RESOLVE_USER, [
+            'field'      => 'email',
+            'values'     => [$emailOrUsername],
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            // core_user_get_users_by_field doesn't document a "not found"
+            // exception (empty array is its not-found signal instead) — any
+            // exception here is an unexpected Moodle-side condition, treated
+            // as unavailable rather than guessed at (same rationale as
+            // _resolveCourseCore()).
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — a bare JSON array of user objects.
+        $users = is_array($result['data']) ? $result['data'] : [];
+        if (empty($users)) {
+            return ['status' => 'not_found'];
+        }
+
+        return [
+            'status' => 'found',
+            'userId' => (int) $users[0]['id'],
+        ];
+    }
+
+    /**
+     * @return array{status:string,courses?:array,message?:string}
+     */
+    private function _enrolledCoursesCore(int $userId): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_USER_COURSES, [
+            'userid' => $userId,
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            if (($result['data']['errorcode'] ?? null) === 'invalidparameter') {
+                return [
+                    'status'  => 'user_not_found',
+                    'message' => $result['data']['message'] ?? 'Moodle user not found.',
+                ];
+            }
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — a bare JSON array of course objects.
+        $rawCourses = is_array($result['data']) ? $result['data'] : [];
+        $courses = array_map(function ($c) {
+            return [
+                'courseId'  => $c['id'] ?? null,
+                'shortname' => $c['shortname'] ?? null,
+                'fullname'  => $c['fullname'] ?? null,
+                'progress'  => $c['progress'] ?? null,
+                'visible'   => $c['visible'] ?? null,
+            ];
+        }, $rawCourses);
+
+        return ['status' => 'ok', 'courses' => $courses];
+    }
+
+    /**
+     * Enrolls a user into a course via the Manual enrolment plugin.
+     * enrol_manual_enrol_users returns null on success — idempotent-ish:
+     * re-enrolling an already-enrolled user updates rather than errors.
+     *
+     * @return array{status:string,message?:string}
+     */
+    private function _enrolUserCore(int $courseId, int $userId, ?int $roleId = null, ?int $status = null): array
+    {
+        $roleId = $roleId ?? (int) (getenv('MOODLE_STUDENT_ROLE_ID') ?: 5);
+
+        $enrolment = [
+            'roleid'   => $roleId,
+            'userid'   => $userId,
+            'courseid' => $courseId,
+        ];
+        // $status is omitted entirely (not sent as 0/null) on the normal
+        // enrollUser()/enrollUserByShortnameAndEmail() call paths, which
+        // never pass it — Moodle defaults a brand-new enrolment to ACTIVE
+        // on its own, so leaving the key out here preserves those two
+        // endpoints' existing behavior exactly as before this change.
+        // Only _updateEnrolmentStatusCore() below ever passes a value.
+        if ($status !== null) {
+            $enrolment['suspend'] = $status;
+        }
+
+        $result = $this->_callMoodleWs(self::WSFUNCTION_ENROL_USER, [
+            'enrolments' => [$enrolment],
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            $errorcode = $result['data']['errorcode'] ?? null;
+
+            if ($errorcode === 'invalidparameter') {
+                return [
+                    'status'  => 'invalid',
+                    'message' => $result['data']['message'] ?? 'Invalid courseId, moodleUserId, or roleId.',
+                ];
+            }
+            if (in_array($errorcode, ['nopermissions', 'required_capability_exception'], true)) {
+                return [
+                    'status'  => 'forbidden',
+                    'message' => $result['data']['message'] ?? 'Moodle denied the enrollment (insufficient WS token permissions).',
+                ];
+            }
+            // Covers "manual enrolment disabled on this course" and any
+            // other unmapped Moodle-side condition — treated as
+            // unavailable rather than guessed at (same rationale as
+            // _resolveCourseCore()).
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — enrol_manual_enrol_users returns null.
+        return ['status' => 'ok'];
+    }
+	
+	/**
+     * Sets an enrolment's status (0=active, 1=suspended) by re-calling
+     * enrol_manual_enrol_users — the SAME WS function _enrolUserCore()
+     * uses to create enrolments in the first place, just with a status
+     * flag included. Moodle's own enrol_manual_external::enrol_users()
+     * treats a repeat call for an already-enrolled user/course pair as an
+     * in-place update rather than a duplicate-create error, which is what
+     * this relies on — there is no separate "update enrolment" WS
+     * function on this Moodle install.
+     *
+     * CAUTION — this is NOT a pure status update: if the user/course pair
+     * was never enrolled, this call enrolls them fresh at whatever
+     * $status is passed (e.g. calling this with SUSPENDED on a
+     * never-enrolled student silently creates a SUSPENDED enrolment
+     * instead of failing). There's no separate WS function on this
+     * install to cheaply check "already enrolled?" first
+     * (core_enrol_get_enrolled_users is scoped per-course, not per-user,
+     * and this controller's own CONNECT/TOTAL_TIMEOUT constants already
+     * flag it as slow on large courses) — so this accepts that trade-off
+     * rather than adding a second Moodle round trip to every status
+     * change. Callers should only invoke this for a user already known
+     * to be enrolled (see updateEnrollmentStatusByShortnameAndEmail()'s
+     * own doc comment). Always uses the default student role (roleId
+     * omitted) since a status change should never also silently change
+     * someone's role.
+     *
+     * @return array{status:string,message?:string}
+     */
+    private function _updateEnrolmentStatusCore(int $courseId, int $userId, int $status): array
+    {
+        return $this->_enrolUserCore($courseId, $userId, null, $status);
+    }
+
+    // ==================================================================
+    // Course groups — find-or-create-then-add-member. Three cores, one
+    // per Moodle WS function, plus _ensureGroupCore() which composes
+    // find + create with a race-safety re-check, the same composition
+    // pattern used by the public enroll*ByShortnameAndEmail() methods.
+    // ==================================================================
+
+    /**
+     * @return array{status:string,groupId?:int,message?:string}
+     */
+    private function _findGroupCore(int $courseId, string $groupName): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_COURSE_GROUPS, [
+            'courseid' => $courseId,
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        $groups = is_array($result['data']) ? $result['data'] : [];
+        foreach ($groups as $g) {
+            // Exact, case-sensitive match — Moodle group names aren't
+            // guaranteed unique in a way we can rely on, so we match
+            // precisely rather than guessing at fuzzy matches.
+            if (($g['name'] ?? null) === $groupName) {
+                return ['status' => 'found', 'groupId' => (int) $g['id']];
+            }
+        }
+
+        return ['status' => 'not_found'];
+    }
+
+    /**
+     * @return array{status:string,groupId?:int,message?:string}
+     */
+    private function _createGroupCore(int $courseId, string $groupName): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_CREATE_GROUPS, [
+            'groups' => [
+                [
+                    'courseid'          => $courseId,
+                    'name'              => $groupName,
+                    // Confirmed via Moodle debuginfo (4.5, this install):
+                    // 'description' is enforced as a required key here,
+                    // not optional-with-default as upstream docs describe.
+                    // Sent explicitly (with its paired descriptionformat)
+                    // so validate_parameters() never sees it missing.
+                    'description'       => '',
+                    // 1 == Moodle's FORMAT_HTML. That constant only exists
+                    // inside Moodle itself — this app calls Moodle over
+                    // HTTP and never loads Moodle's PHP, so it must be
+                    // hardcoded here rather than referenced by name.
+                    'descriptionformat' => 1,
+                ],
+            ],
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            // Covers a duplicate-name race between _findGroupCore() and
+            // here — treated as a signal to re-resolve, not a hard
+            // failure (handled by the caller, _ensureGroupCore()).
+            return ['status' => 'create_failed', 'message' => $result['message']];
+        }
+
+        $created = is_array($result['data']) ? $result['data'] : [];
+        if (empty($created) || !isset($created[0]['id'])) {
+            return ['status' => 'create_failed', 'message' => 'Moodle did not return a created group id.'];
+        }
+
+        return ['status' => 'ok', 'groupId' => (int) $created[0]['id']];
+    }
+
+    /**
+     * @return array{status:string,message?:string}
+     */
+    private function _addGroupMemberCore(int $groupId, int $userId): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_ADD_GROUP_MEMBER, [
+            'members' => [
+                [
+                    'groupid' => $groupId,
+                    'userid'  => $userId,
+                ],
+            ],
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            $errorcode = $result['data']['errorcode'] ?? null;
+            if (in_array($errorcode, ['invalidparameter', 'invalidrecord'], true)) {
+                return [
+                    'status'  => 'invalid',
+                    'message' => $result['data']['message'] ?? 'Invalid groupId or userId.',
+                ];
+            }
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // success — core_group_add_group_members returns null.
+        return ['status' => 'ok'];
+    }
+
+    /**
+     * Find-or-create a group by name in a course, with a single
+     * race-safety re-check if creation fails (e.g. another concurrent
+     * request created the same-named group between our find and create).
+     *
+     * @return array{status:string,groupId?:int,created?:bool,message?:string}
+     */
+    private function _ensureGroupCore(int $courseId, string $groupName): array
+    {
+        $found = $this->_findGroupCore($courseId, $groupName);
+        if ($found['status'] === 'timeout' || $found['status'] === 'unavailable') {
+            return $found;
+        }
+        if ($found['status'] === 'found') {
+            return ['status' => 'ok', 'groupId' => $found['groupId'], 'created' => false];
+        }
+
+        // not_found — attempt to create it.
+        $created = $this->_createGroupCore($courseId, $groupName);
+        if ($created['status'] === 'ok') {
+            return ['status' => 'ok', 'groupId' => $created['groupId'], 'created' => true];
+        }
+        if ($created['status'] === 'timeout' || $created['status'] === 'unavailable') {
+            return $created;
+        }
+
+        // create_failed — re-resolve once rather than failing outright.
+        $recheck = $this->_findGroupCore($courseId, $groupName);
+        if ($recheck['status'] === 'found') {
+            return ['status' => 'ok', 'groupId' => $recheck['groupId'], 'created' => false];
+        }
+
+        return ['status' => 'unavailable', 'message' => $created['message'] ?? 'Unable to create or resolve the group.'];
+    }
+
+    /**
+     * Best-effort group ensure+add after a successful enrollment. Never
+     * escalates to an HTTP-level failure for group problems — enrollment
+     * already succeeded by the time this runs, so this always returns a
+     * descriptive sub-object instead of throwing the request off course.
+     *
+     * @return array{status:string,groupId?:int,created?:bool,message?:string}
+     */
+    private function _handleGroupAssignment(int $courseId, int $userId, string $groupName): array
+    {
+        $ensured = $this->_ensureGroupCore($courseId, $groupName);
+        if ($ensured['status'] !== 'ok') {
+            return ['status' => 'failed', 'message' => $ensured['message'] ?? 'Could not resolve or create the group.'];
+        }
+
+        $added = $this->_addGroupMemberCore($ensured['groupId'], $userId);
+        if ($added['status'] !== 'ok') {
+            return [
+                'status'  => 'failed',
+                'groupId' => $ensured['groupId'],
+                'created' => $ensured['created'],
+                'message' => $added['message'] ?? 'Group existed/created but adding the member failed.',
+            ];
+        }
+
+        return [
+            'status'  => 'ok',
+            'groupId' => $ensured['groupId'],
+            'created' => $ensured['created'],
+        ];
+    }
+
+    // ==================================================================
+    // 4.4 Private transport helper — the ONE method that ever talks to
+    // Moodle. Builds the POST body (http_build_query() so the nested
+    // options[0][name]/options[0][value] syntax core_enrol_get_enrolled_users
+    // needs is encoded correctly), applies a bounded cURL timeout, and
+    // detects the three response shapes Moodle can return.
+    //
+    // @return array{type:'success'|'exception'|'timeout'|'transport', data?:mixed, message?:string}
+    // ==================================================================
+    private function _callMoodleWs(string $wsfunction, array $params): array
+    {
+        $baseUrl = getenv('MOODLE_BASE_URL');
+        $wstoken = getenv('MOODLE_WSTOKEN');
+
+        if ($baseUrl === false || $baseUrl === '' || $wstoken === false || $wstoken === '') {
+            // Fails loudly per plan §6 — never silently hits Moodle with
+            // an empty credential. Surfaced to the caller as a normal
+            // "transport" failure so the public methods still return the
+            // documented 502 shape rather than a raw exception.
+            return [
+                'type'    => 'transport',
+                'message' => 'Moodle is not configured (MOODLE_BASE_URL / MOODLE_WSTOKEN missing).',
+            ];
+        }
+
+        $body = array_merge([
+            'wstoken'          => $wstoken,
+            'wsfunction'       => $wsfunction,
+            'moodlewsrestformat' => 'json',
+        ], $params);
+
+        $postFields = http_build_query($body);
+
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => $baseUrl,
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $postFields,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => self::CONNECT_TIMEOUT_SECONDS,
+            CURLOPT_TIMEOUT        => self::TOTAL_TIMEOUT_SECONDS,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+        ]);
+
+        $response = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $httpStatus = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        //curl_close($ch);
+
+        if ($errno === CURLE_OPERATION_TIMEDOUT) {
+            return [
+                'type'    => 'timeout',
+                'message' => 'Request to Moodle timed out.',
+            ];
+        }
+
+        if ($errno !== 0 || $response === false) {
+            return [
+                'type'    => 'transport',
+                'message' => 'Unable to reach Moodle: ' . curl_strerror($errno),
+            ];
+        }
+
+        if ($httpStatus < 200 || $httpStatus >= 300) {
+            return [
+                'type'    => 'transport',
+                'message' => 'Moodle returned an unexpected HTTP status (' . $httpStatus . ').',
+            ];
+        }
+
+        $decoded = json_decode($response, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            return [
+                'type'    => 'transport',
+                'message' => 'Moodle returned a response that could not be parsed.',
+            ];
+        }
+
+        // Moodle's own exception shape: { "exception": ..., "errorcode": ..., "message": ..., "debuginfo": ... }
+        if (is_array($decoded) && array_key_exists('exception', $decoded)) {
+            // debuginfo is only populated when Moodle's own debug mode is
+            // on, and is far more specific than message (e.g. names the
+            // exact offending param/key). Never sent to the API client —
+            // logged server-side only, so callers can diagnose without
+            // exposing internal Moodle detail over HTTP.
+            error_log(sprintf(
+                '[MoodleController] %s failed: errorcode=%s message=%s debuginfo=%s',
+                $wsfunction,
+                $decoded['errorcode'] ?? 'unknown',
+                $decoded['message'] ?? '',
+                $decoded['debuginfo'] ?? '(debug mode off — enable it in Moodle to get detail here)'
+            ));
+
+            return [
+                'type'    => 'exception',
+                'data'    => $decoded,
+                'message' => $decoded['message'] ?? ('Moodle error: ' . ($decoded['errorcode'] ?? 'unknown')),
+            ];
+        }
+
+        return ['type' => 'success', 'data' => $decoded];
+    }
+
+    // ==================================================================
+    // Response helpers — shared envelope + explicit HTTP status, matching
+    // the conventions already established by StudentSubjectEnrollmentController
+    // and LmsController.
+    // ==================================================================
+    private function _respond(int $httpStatus, array $payload): void
+    {
+        http_response_code($httpStatus);
+        header('Content-Type: application/json');
+        echo json_encode($payload);
+    }
+
+    private function _fail(int $httpStatus, string $code, string $message): void
+    {
+        $this->_respond($httpStatus, [
+            'ok'    => false,
+            'error' => ['code' => $code, 'message' => $message],
+        ]);
+    }
+}

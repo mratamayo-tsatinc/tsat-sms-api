@@ -1,0 +1,137 @@
+<?php
+ 
+return [
+    'GET' => [
+        'api/admission/bootstrap'         => [\App\Controllers\AdmissionController::class,   'bootstrap'],
+        'api/admission/students'          => [\App\Controllers\AdmissionController::class,   'students'],
+        'api/admission/search'            => [\App\Controllers\AdmissionController::class,   'search'],
+		'api/admission/lookups'           => [\App\Controllers\AdmissionController::class,   'lookups'],
+        'api/admission/programs'          => [\App\Controllers\EnrollmentController::class,  'programs'],
+        'api/admission/next-number'       => [\App\Controllers\AdmissionController::class,   'nextNumberPreview'],
+        'api/admission/lock/active'       => [\App\Controllers\EditLockController::class,    'active'],
+		'api/geo/provinces'               => [\App\Controllers\PsgcController::class,         'provinces'],
+        'api/geo/cities'                  => [\App\Controllers\PsgcController::class,         'cities'],
+        'api/geo/barangays'               => [\App\Controllers\PsgcController::class,         'barangays'],
+        'api/enrollment/bootstrap'        => [\App\Controllers\EnrollmentController::class,  'bootstrap'],
+		'api/enrollment/active-term' 	  => [\App\Controllers\EnrollmentController::class, 'activeTerm'],	
+        'api/enrollment/summary'          => [\App\Controllers\EnrollmentController::class,  'summary'],
+        'api/enrollment/roster'           => [\App\Controllers\EnrollmentController::class,  'roster'],
+        'api/enrollment/students'         => [\App\Controllers\EnrollmentController::class,  'students'],
+		'api/enrollment/search'           => [\App\Controllers\EnrollmentController::class,  'search'],
+        'api/enrollment/fees'             => [\App\Controllers\EnrollmentController::class,  'fees'],
+        'api/enrollment/fee-templates'    => [\App\Controllers\EnrollmentController::class,  'feeTemplates'],
+        'api/enrollment/fee-template-fees'=> [\App\Controllers\EnrollmentController::class,  'feeTemplateFees'],
+        'api/enrollment/sections'         => [\App\Controllers\EnrollmentController::class,  'sections'],
+        'api/enrollment/programs'         => [\App\Controllers\EnrollmentController::class,  'programs'],
+        'api/id/bootstrap'                => [\App\Controllers\IdController::class,          'bootstrap'],
+        'api/id/student'                  => [\App\Controllers\IdController::class,          'student'],
+        'api/id/enrolled'                 => [\App\Controllers\IdController::class,          'enrolled'],
+        'api/id/student-index'            => [\App\Controllers\IdController::class,          'studentIndex'],
+        // Delegates to EnrollmentController::activeTerm() — the active term
+        // is a shared application-wide setting stored in tblAppSettings, not module-specific.
+        'api/id/active-term'              => [\App\Controllers\EnrollmentController::class,  'activeTerm'],
+        // Returns every ID application joined with student, registration, program,
+        // and section data, formatted for card export. Unfiltered by term.
+        'api/id/applications/export'      => [\App\Controllers\IdController::class,          'applicationList'],
+        'api/lms/bootstrap'               => [\App\Controllers\LmsController::class,         'bootstrap'],
+        'api/lms/accounts'                => [\App\Controllers\LmsController::class,         'accounts'],
+        // Delegates to EnrollmentController::activeTerm() — the active term
+        // is a shared application-wide setting stored in tblAppSettings, not module-specific.
+        'api/lms/active-term'             => [\App\Controllers\EnrollmentController::class,  'activeTerm'],
+ 
+        // ── Accounts module ──
+        // Reference/lookup endpoints are aliased to EnrollmentController methods:
+        // tblFees, tblSections, tblPrograms, and tblStudents are shared tables with
+        // no module-specific logic in ReferenceDataService.
+        'api/accounts/fees'               => [\App\Controllers\EnrollmentController::class,  'fees'],
+        'api/accounts/fee-templates'      => [\App\Controllers\EnrollmentController::class,  'feeTemplates'],
+        'api/accounts/fee-template-fees'  => [\App\Controllers\EnrollmentController::class,  'feeTemplateFees'],
+        'api/accounts/sections'           => [\App\Controllers\EnrollmentController::class,  'sections'],
+        'api/accounts/programs'           => [\App\Controllers\EnrollmentController::class,  'programs'],
+        'api/accounts/students'           => [\App\Controllers\EnrollmentController::class,  'students'],
+        // Returns all distinct academicYear/semester combinations from tblRegistrations
+        // for the Accounts term-filter dropdowns. Not restricted to the active term.
+        'api/accounts/filters'            => [\App\Controllers\AccountsController::class,    'filters'],
+        // Full-detail search for Accounts — includes registrations, assessments,
+        // and payments. Can be scoped to a specific term or all terms.
+        'api/accounts/search'             => [\App\Controllers\AccountsController::class,    'search'],
+ 
+        // ── Cashier module ──
+        // Fees are aliased to EnrollmentController::fees() — tblFees is a shared,
+        // module-agnostic table with no Cashier-specific logic.
+        'api/cashier/fees'                => [\App\Controllers\EnrollmentController::class,  'fees'],
+        // Delegates to EnrollmentController::activeTerm() — the active term
+        // is a shared application-wide setting stored in tblAppSettings, not module-specific.
+        'api/cashier/active-term'         => [\App\Controllers\EnrollmentController::class,  'activeTerm'],
+        // Student typeahead scoped to a specific academicYear/semester. Unlike the
+        // shared students() endpoint, only returns students with a matching registration.
+        'api/cashier/students'            => [\App\Controllers\CashierController::class,     'students'],
+        // Returns outstanding assessment balances for a student in the active term.
+        'api/cashier/balances'            => [\App\Controllers\CashierController::class,     'balances'],
+	'api/cashier/payment-history' => [\App\Controllers\CashierController::class, 'paymentHistory'],
+	'api/cashier/receipt'         => [\App\Controllers\CashierController::class, 'receipt'],
+	'api/cashier/summary/bootstrap'   => [\App\Controllers\CashierSummaryController::class, 'bootstrap'],
+        'api/cashier/summary/report'      => [\App\Controllers\CashierSummaryController::class, 'report'],
+	
+	// ── Loading module: Teachers ──
+    	'api/subject-loading/teachers'        => [\App\Controllers\SubjectLoading\TeacherController::class, 'list'],
+    	'api/subject-loading/teachers/search' => [\App\Controllers\SubjectLoading\TeacherController::class, 'search'],
+
+    	// ── Loading module: Subjects ──
+    	'api/subject-loading/subjects'        => [\App\Controllers\SubjectLoading\SubjectController::class, 'list'],
+
+    	// ── Loading module: shared bootstrap/reference ──
+    	'api/subject-loading/bootstrap'       => [\App\Controllers\SubjectLoading\LoadingController::class, 'bootstrap'],
+    	'api/subject-loading/active-term'     => [\App\Controllers\SubjectLoading\LoadingController::class, 'activeTerm'],
+    	'api/subject-loading/classes'         => [\App\Controllers\SubjectLoading\LoadingController::class, 'classes'],
+    	'api/subject-loading/programs'        => [\App\Controllers\SubjectLoading\LoadingController::class, 'programs'],
+    	'api/subject-loading/sections'        => [\App\Controllers\SubjectLoading\LoadingController::class, 'sections'],
+    	'api/subject-loading/class-roster'    => [\App\Controllers\SubjectLoading\LoadingController::class, 'classRoster'],
+    ],
+    'POST' => [
+        'api/admission/store'        => [\App\Controllers\AdmissionController::class,   'store'],
+        'api/admission/mirror'       => [\App\Controllers\AdmissionController::class,   'mirror'],
+        'api/admission/students/stub'   => [\App\Controllers\AdmissionController::class, 'createStub'],
+        'api/admission/lock/acquire'    => [\App\Controllers\EditLockController::class,  'acquire'],
+        'api/admission/lock/release'    => [\App\Controllers\EditLockController::class,  'release'],
+        'api/admission/students/update' => [\App\Controllers\AdmissionController::class, 'updateStudent'],
+        'api/enrollment/mirror'      => [\App\Controllers\EnrollmentController::class,  'mirror'],
+		'api/enrollment/registrations'        => [\App\Controllers\EnrollmentController::class,  'createRegistration'],
+        'api/enrollment/registrations/update' => [\App\Controllers\EnrollmentController::class,  'updateRegistration'],
+        'api/enrollment/assessments/commit'   => [\App\Controllers\EnrollmentController::class,  'commitAssessmentDrafts'],
+        'api/id/mirror'              => [\App\Controllers\IdController::class,          'mirror'],
+        'api/id/applications'        => [\App\Controllers\IdController::class,          'createApplication'],
+        'api/id/applications/status' => [\App\Controllers\IdController::class,          'updateApplicationStatus'],
+        'api/id/applications/print-status' => [\App\Controllers\IdController::class,    'updatePrintStatus'],
+        'api/lms/mirror'             => [\App\Controllers\LmsController::class,         'mirror'],
+	'api/lms/accounts/process'   => [\App\Controllers\LmsController::class,         'processAccount'],
+	'api/lms/accounts/release'   => [\App\Controllers\LmsController::class,         'releaseAccount'],
+	'api/lms/accounts/complete'  => [\App\Controllers\LmsController::class,         'completeAccount'],
+	'api/lms/accounts/import/workspace' => [\App\Controllers\LmsController::class,   'importWorkspaceCsv'],
+	'api/lms/accounts/import/moodle'    => [\App\Controllers\LmsController::class,   'importMoodleCsv'],
+
+        'api/import'                 => [\App\Controllers\ImportController::class,       'handle'],
+ 
+        // Alias to EnrollmentController::mirror() — handles receipt_create and
+        // receipt_detail_create write operations for the Accounts module.
+        'api/accounts/mirror'        => [\App\Controllers\EnrollmentController::class,  'mirror'],
+
+        // Creates an assessment line on an existing registration. Accounts-specific write endpoint.
+        'api/accounts/assessments'   => [\App\Controllers\AccountsController::class,   'createAssessment'],
+
+        // Creates a payment receipt on an existing registration. Accounts-specific write endpoint.
+        'api/accounts/receipts'      => [\App\Controllers\AccountsController::class,   'createReceipt'],
+
+        // Allocates a portion of a receipt toward a specific assessment line.
+        // Enforces receipt-remaining and assessment-remaining over-allocation guards.
+        'api/accounts/receipt-details' => [\App\Controllers\AccountsController::class, 'createReceiptDetail'],
+ 
+        // Adds a new assessment line to an active-term registration. Cashier-specific write endpoint.
+        'api/cashier/assessments'    => [\App\Controllers\CashierController::class,   'createAssessment'],
+
+        // Alias to EnrollmentController::mirror() — handles assessment_create,
+        // receipt_create, and receipt_detail_create write operations for the Cashier module.
+        'api/cashier/mirror'         => [\App\Controllers\EnrollmentController::class,  'mirror'],
+	'api/cashier/payments' => [\App\Controllers\CashierController::class, 'createPayment'],
+    ],
+];
