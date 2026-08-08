@@ -661,6 +661,71 @@ class MoodleController
     }
 
     // ==================================================================
+    // 4.9b examPermitStatusByEmails() — POST /api/moodle/users/exam-permit-status/bulk
+    // Body: { emails: string[] }
+    //
+    // Bulk sibling of examPermitStatusByEmail() above — resolves ALL
+    // FOUR periods for MANY students in ONE Moodle round trip instead of
+    // one request per student, using the same core_user_get_users_by_field
+    // WS function with an array of emails (see
+    // _resolveUserExamPermitsBulkCore()'s doc comment). POST rather than
+    // GET despite being read-only: a class roster's worth of emails in a
+    // querystring risks hitting URL length limits that a JSON body does
+    // not, matching this codebase's existing GET-for-simple-reads /
+    // POST-for-larger-payloads split.
+    //
+    // Response shape mirrors the request: { ok:true, results: { <email
+    // as sent>: {found, userId, examPermits} } } — every requested email
+    // is guaranteed a key, even ones Moodle didn't find, so the caller
+    // never has to special-case a missing key vs. an explicit not-found.
+    // ==================================================================
+    public function examPermitStatusByEmails(): void
+    {
+        try {
+            $input  = json_decode(file_get_contents('php://input'), true) ?? [];
+            $emails = $input['emails'] ?? null;
+
+            if (!is_array($emails) || empty($emails)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'emails must be a non-empty array.');
+                return;
+            }
+
+            // Normalize: string-cast, trim, drop empties, de-dupe. Casing
+            // and exact text are preserved (beyond trimming) since the
+            // response is keyed back by these exact strings.
+            $emails = array_values(array_unique(array_filter(array_map(
+                function ($e) { return is_string($e) ? trim($e) : ''; },
+                $emails
+            ), function ($e) { return $e !== ''; })));
+
+            if (empty($emails)) {
+                $this->_fail(422, 'VALIDATION_ERROR', 'emails must contain at least one non-empty value.');
+                return;
+            }
+
+            $core = $this->_resolveUserExamPermitsBulkCore($emails);
+
+            switch ($core['status']) {
+                case 'ok':
+                    $this->_respond(200, [
+                        'ok'      => true,
+                        'results' => $core['results'],
+                    ]);
+                    return;
+                case 'timeout':
+                    $this->_fail(504, 'MOODLE_TIMEOUT', $core['message']);
+                    return;
+                case 'unavailable':
+                default:
+                    $this->_fail(502, 'MOODLE_UNAVAILABLE', $core['message']);
+                    return;
+            }
+        } catch (\Throwable $e) {
+            $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error reading Exam Permit status in bulk.');
+        }
+    }
+
+    // ==================================================================
     // 4.10 updateExamPermitStatusByEmail() — POST /api/moodle/users/exam-permit-status
     // Body: { email, period: 'PRELIM'|'MIDTERM'|'SEMIFINALS'|'FINALS', active: true|false }
     //
@@ -948,6 +1013,26 @@ class MoodleController
         $user = $users[0];
         $customFields = is_array($user['customfields'] ?? null) ? $user['customfields'] : [];
 
+        return [
+            'status'      => 'found',
+            'userId'      => (int) $user['id'],
+            'examPermits' => $this->_extractExamPermitsFromCustomFields($customFields),
+        ];
+    }
+
+    /**
+     * Shared by _resolveUserExamPermitsCore() (single) and
+     * _resolveUserExamPermitsBulkCore() (many) — takes one Moodle user's
+     * raw 'customfields' array and maps it to the four-period Exam
+     * Permit shape both callers return. Pulled out so the bulk path
+     * doesn't duplicate this field-mapping logic per user.
+     *
+     * @param array $customFields raw 'customfields' entries from a single
+     *   core_user_get_users_by_field user record
+     * @return array<string,array{fieldConfigured:bool,active:?bool,rawValue:?string}>
+     */
+    private function _extractExamPermitsFromCustomFields(array $customFields): array
+    {
         $rawByShortname = [];
         foreach ($customFields as $cf) {
             if (isset($cf['shortname'])) {
@@ -970,7 +1055,78 @@ class MoodleController
             ];
         }
 
-        return ['status' => 'found', 'userId' => (int) $user['id'], 'examPermits' => $examPermits];
+        return $examPermits;
+    }
+
+    /**
+     * Bulk sibling of _resolveUserExamPermitsCore() — resolves MANY users
+     * by email and extracts all four Exam Permit customfields for each,
+     * in ONE core_user_get_users_by_field call. Moodle's 'values' param
+     * already accepts an array (the single-user core above just always
+     * passed a one-element array); the only new work here is matching
+     * each returned user back to the email that was requested, since
+     * Moodle silently OMITS any email it can't find rather than
+     * returning a placeholder for it — so every requested email that
+     * doesn't come back in the response is resolved as not-found here,
+     * not left unanswered.
+     *
+     * @param string[] $emails
+     * @return array{status:string,results?:array<string,array{found:bool,userId:?int,examPermits:?array}>,message?:string}
+     */
+    private function _resolveUserExamPermitsBulkCore(array $emails): array
+    {
+        $result = $this->_callMoodleWs(self::WSFUNCTION_RESOLVE_USER, [
+            'field'  => 'email',
+            'values' => $emails,
+        ]);
+
+        if ($result['type'] === 'timeout') {
+            return ['status' => 'timeout', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'transport') {
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+        if ($result['type'] === 'exception') {
+            // Same rationale as _resolveUserExamPermitsCore(): no
+            // documented "not found" exception for this WS function —
+            // Moodle just omits unmatched emails from the returned array.
+            return ['status' => 'unavailable', 'message' => $result['message']];
+        }
+
+        // $result['type'] === 'success' — a bare JSON array of user
+        // objects, one per email Moodle actually matched. Order is not
+        // guaranteed to follow the request, and unmatched emails are
+        // simply absent rather than null-padded.
+        $users = is_array($result['data']) ? $result['data'] : [];
+
+        // Moodle matches email case-insensitively, so key the lookup map
+        // the same way to avoid missing a match over a casing difference
+        // between what we stored and what's on the Moodle account.
+        $userByLowerEmail = [];
+        foreach ($users as $u) {
+            if (isset($u['email'])) {
+                $userByLowerEmail[strtolower((string) $u['email'])] = $u;
+            }
+        }
+
+        $results = [];
+        foreach ($emails as $email) {
+            $user = $userByLowerEmail[strtolower($email)] ?? null;
+
+            if ($user === null) {
+                $results[$email] = ['found' => false, 'userId' => null, 'examPermits' => null];
+                continue;
+            }
+
+            $customFields = is_array($user['customfields'] ?? null) ? $user['customfields'] : [];
+            $results[$email] = [
+                'found'       => true,
+                'userId'      => (int) $user['id'],
+                'examPermits' => $this->_extractExamPermitsFromCustomFields($customFields),
+            ];
+        }
+
+        return ['status' => 'ok', 'results' => $results];
     }
 
     /**

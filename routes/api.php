@@ -205,6 +205,13 @@ return [
         // customfields as a partial update, so this never touches the
         // other three periods). Body: { email, period, active }.
         'api/moodle/users/exam-permit-status' => [\App\Controllers\MoodleController::class, 'updateExamPermitStatusByEmail'],
+
+        // Exam Permit — bulk READ of all 4 periods for MANY students in
+        // one Moodle round trip (core_user_get_users_by_field accepts an
+        // array of emails). POST rather than GET purely to carry a whole
+        // roster's worth of emails without risking a URL length limit —
+        // this does not write anything.
+        'api/moodle/users/exam-permit-status/bulk' => [\App\Controllers\MoodleController::class, 'examPermitStatusByEmails'],
 		
         'api/import'                 => [\App\Controllers\ImportController::class,       'handle'],
  
