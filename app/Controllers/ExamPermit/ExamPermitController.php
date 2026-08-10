@@ -3,10 +3,12 @@
 namespace App\Controllers\ExamPermit;
 
 use App\Services\ExamPermitReferenceDataService;
+use App\Services\ExamPermitWorkflowService;
 
 /**
- * Exam Permit module — read-only. Same try/catch-everything, {ok:bool}
- * envelope convention as every other controller in this codebase.
+ * Exam Permit module controller.
+ * Uses the same try/catch and {ok:bool} envelope conventions as the rest
+ * of the codebase for both read and write endpoints.
  */
 class ExamPermitController
 {
@@ -100,6 +102,113 @@ class ExamPermitController
         }
     }
 
+    /**
+     * POST /api/exam-permit/generate
+     * Body: { studentNumber, academicYear, semester, period, actorEmail }
+     */
+    public function generate()
+    {
+        try {
+            $body = $this->_readJsonBody();
+            $result = (new ExamPermitWorkflowService())->generatePermit($body);
+
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                $status = ($code === 'VALIDATION_ERROR') ? 400 : (($code === 'GATE_DENIED' || $code === 'NOT_REGISTERED_THIS_TERM') ? 409 : 500);
+                http_response_code($status);
+                echo json_encode([
+                    'ok' => false,
+                    'error' => [
+                        'code' => $code,
+                        'message' => (string)($result['message'] ?? 'Unable to generate permit.'),
+                    ],
+                    'gate' => $result['gate'] ?? null,
+                ]);
+                return;
+            }
+
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * POST /api/exam-permit/print-status
+     * Body: { permitID, actorEmail }
+     */
+    public function updatePrintStatus()
+    {
+        try {
+            $body = $this->_readJsonBody();
+            $result = (new ExamPermitWorkflowService())->updatePrintStatus($body);
+
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                $status = ($code === 'VALIDATION_ERROR') ? 400 : (($code === 'PERMIT_NOT_FOUND') ? 404 : (($code === 'POLICY_CHANGED' || $code === 'NOT_REGISTERED_THIS_TERM') ? 409 : 500));
+                http_response_code($status);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to update print status.')]]);
+                return;
+            }
+
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/latest-issued?studentNumber=...&academicYear=...&semester=...&period=optional
+     */
+    public function latestIssued()
+    {
+        try {
+            $result = (new ExamPermitWorkflowService())->latestIssued([
+                'studentNumber' => $_GET['studentNumber'] ?? '',
+                'academicYear' => $_GET['academicYear'] ?? '',
+                'semester' => $_GET['semester'] ?? '',
+                'period' => $_GET['period'] ?? '',
+            ]);
+
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                http_response_code($code === 'VALIDATION_ERROR' ? 400 : 500);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to load latest permit.')]]);
+                return;
+            }
+
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/moodle-eligibility?studentNumber=...&academicYear=...&semester=...&period=...
+     */
+    public function moodleEligibility()
+    {
+        try {
+            $result = (new ExamPermitWorkflowService())->moodleEligibility([
+                'studentNumber' => $_GET['studentNumber'] ?? '',
+                'academicYear' => $_GET['academicYear'] ?? '',
+                'semester' => $_GET['semester'] ?? '',
+                'period' => $_GET['period'] ?? '',
+            ]);
+
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                http_response_code($code === 'VALIDATION_ERROR' ? 400 : 500);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to evaluate Moodle eligibility.')]]);
+                return;
+            }
+
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
     private function _errorMessage(?string $code): string
     {
         if ($code === 'INVALID_PERIOD') return 'period must be one of PRELIM, MIDTERM, SEMIFINALS, FINALS.';
@@ -111,6 +220,14 @@ class ExamPermitController
     {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => ['code' => 'VALIDATION_ERROR', 'message' => $message]]);
+    }
+
+    private function _readJsonBody(): array
+    {
+        $raw = file_get_contents('php://input');
+        if ($raw === false || trim($raw) === '') return [];
+        $data = json_decode($raw, true);
+        return is_array($data) ? $data : [];
     }
 
     private function _serverError(\Throwable $e): void

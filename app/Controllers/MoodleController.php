@@ -743,6 +743,8 @@ class MoodleController
             $email  = isset($input['email']) ? trim((string) $input['email']) : '';
             $period = isset($input['period']) ? strtoupper(trim((string) $input['period'])) : '';
             $active = $input['active'] ?? null;
+            $actorEmail = isset($input['actorEmail']) ? trim((string) $input['actorEmail']) : '';
+            $actor = $actorEmail !== '' ? $actorEmail : $email;
 
             if ($email === '' || !isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period]) || !is_bool($active)) {
                 $this->_fail(422, 'VALIDATION_ERROR', 'email, a valid period (PRELIM/MIDTERM/SEMIFINALS/FINALS), and a boolean active are required.');
@@ -766,24 +768,112 @@ class MoodleController
                 return;
             }
 
+            $localCtx = $this->_resolveExamPermitLocalGateContextByEmail($email);
+            if ($localCtx['status'] !== 'ok') {
+                if ($localCtx['status'] === 'not_linked') {
+                    $this->_fail(409, 'EXAM_PERMIT_PRECONDITION_FAILED', 'Moodle email is not linked to a local student record.');
+                    return;
+                }
+                $this->_fail(500, 'EXAM_PERMIT_PRECONDITION_ERROR', $localCtx['message'] ?? 'Unable to evaluate exam permit preconditions.');
+                return;
+            }
+
+            $workflow = new \App\Services\ExamPermitWorkflowService();
+            $eligibility = $workflow->moodleEligibility([
+                'studentNumber' => $localCtx['studentNumber'],
+                'academicYear' => $localCtx['academicYear'],
+                'semester' => $localCtx['semester'],
+                'period' => $period,
+            ]);
+
+            if (($eligibility['ok'] ?? false) !== true) {
+                $this->_fail(500, 'EXAM_PERMIT_PRECONDITION_ERROR', $eligibility['message'] ?? 'Unable to evaluate exam permit preconditions.');
+                return;
+            }
+
+            if (($eligibility['eligible'] ?? false) !== true) {
+                $workflow->logMoodleAction([
+                    'studentNumber' => $localCtx['studentNumber'],
+                    'academicYear' => $localCtx['academicYear'],
+                    'semester' => $localCtx['semester'],
+                    'period' => $period,
+                    'actorEmail' => $actor,
+                    'active' => $active,
+                    'outcome' => 'DENY',
+                    'detail' => (string)($eligibility['message'] ?? 'Exam permit precondition failed.'),
+                ]);
+                $this->_fail(409, 'EXAM_PERMIT_PRECONDITION_FAILED', (string)($eligibility['message'] ?? 'Exam permit precondition failed.'));
+                return;
+            }
+
             $update = $this->_setUserExamPermitCore($resolved['userId'], $period, $active);
 
             switch ($update['status']) {
                 case 'invalid_period': // defensive only — already validated above
                 case 'invalid':
+                    $workflow->logMoodleAction([
+                        'studentNumber' => $localCtx['studentNumber'],
+                        'academicYear' => $localCtx['academicYear'],
+                        'semester' => $localCtx['semester'],
+                        'period' => $period,
+                        'actorEmail' => $actor,
+                        'active' => $active,
+                        'outcome' => 'FAILED',
+                        'detail' => $update['message'] ?? 'Moodle status update rejected as invalid.',
+                    ]);
                     $this->_fail(422, 'EXAM_PERMIT_UPDATE_INVALID', $update['message']);
                     return;
                 case 'forbidden':
+                    $workflow->logMoodleAction([
+                        'studentNumber' => $localCtx['studentNumber'],
+                        'academicYear' => $localCtx['academicYear'],
+                        'semester' => $localCtx['semester'],
+                        'period' => $period,
+                        'actorEmail' => $actor,
+                        'active' => $active,
+                        'outcome' => 'FAILED',
+                        'detail' => $update['message'] ?? 'Moodle denied exam permit update.',
+                    ]);
                     $this->_fail(502, 'MOODLE_FORBIDDEN', $update['message']);
                     return;
                 case 'timeout':
+                    $workflow->logMoodleAction([
+                        'studentNumber' => $localCtx['studentNumber'],
+                        'academicYear' => $localCtx['academicYear'],
+                        'semester' => $localCtx['semester'],
+                        'period' => $period,
+                        'actorEmail' => $actor,
+                        'active' => $active,
+                        'outcome' => 'FAILED',
+                        'detail' => $update['message'] ?? 'Moodle timeout during exam permit update.',
+                    ]);
                     $this->_fail(504, 'MOODLE_TIMEOUT', $update['message']);
                     return;
                 case 'unavailable':
+                    $workflow->logMoodleAction([
+                        'studentNumber' => $localCtx['studentNumber'],
+                        'academicYear' => $localCtx['academicYear'],
+                        'semester' => $localCtx['semester'],
+                        'period' => $period,
+                        'actorEmail' => $actor,
+                        'active' => $active,
+                        'outcome' => 'FAILED',
+                        'detail' => $update['message'] ?? 'Moodle unavailable during exam permit update.',
+                    ]);
                     $this->_fail(502, 'MOODLE_UNAVAILABLE', $update['message']);
                     return;
                 case 'ok':
                 default:
+                    $workflow->logMoodleAction([
+                        'studentNumber' => $localCtx['studentNumber'],
+                        'academicYear' => $localCtx['academicYear'],
+                        'semester' => $localCtx['semester'],
+                        'period' => $period,
+                        'actorEmail' => $actor,
+                        'active' => $active,
+                        'outcome' => 'SUCCESS',
+                        'detail' => 'Moodle exam permit status updated successfully.',
+                    ]);
                     $this->_respond(200, [
                         'ok'      => true,
                         'updated' => true,
@@ -795,6 +885,35 @@ class MoodleController
             }
         } catch (\Throwable $e) {
             $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error updating Exam Permit status.');
+        }
+    }
+
+    private function _resolveExamPermitLocalGateContextByEmail(string $email): array
+    {
+        try {
+            $db = \App\Core\Database::getConnection();
+
+            $stmt = $db->prepare("SELECT studentNumber FROM tblLmsAccounts WHERE LOWER(moodleEmail) = LOWER(:email) LIMIT 1");
+            $stmt->execute([':email' => $email]);
+            $row = $stmt->fetch();
+            $studentNumber = trim((string)($row['studentNumber'] ?? ''));
+
+            if ($studentNumber === '') {
+                return ['status' => 'not_linked'];
+            }
+
+            $term = (new \App\Services\ReferenceDataService())->getActiveTerm();
+            return [
+                'status' => 'ok',
+                'studentNumber' => $studentNumber,
+                'academicYear' => (string)$term['academicYear'],
+                'semester' => (string)$term['semester'],
+            ];
+        } catch (\Throwable $e) {
+            return [
+                'status' => 'error',
+                'message' => $e->getMessage(),
+            ];
         }
     }
 

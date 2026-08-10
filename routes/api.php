@@ -161,6 +161,8 @@ return [
 		'api/exam-permit/bootstrap' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'bootstrap'],
 		'api/exam-permit/students'  => [\App\Controllers\ExamPermit\ExamPermitController::class, 'students'],
 		'api/exam-permit/permit'    => [\App\Controllers\ExamPermit\ExamPermitController::class, 'permit'],
+        'api/exam-permit/latest-issued' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssued'],
+        'api/exam-permit/moodle-eligibility' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'moodleEligibility'],
     ],
     'POST' => [
         'api/admission/store'        => [\App\Controllers\AdmissionController::class,   'store'],
@@ -280,5 +282,9 @@ return [
 		'api/ecr/mirror/roster/upsert'             => [\App\Controllers\Ecr\EcrMirrorController::class, 'upsertRosterRow'],
 		'api/ecr/mirror/roster/upsert-bulk'        => [\App\Controllers\Ecr\EcrMirrorController::class, 'upsertRosterRowsBulk'],
 		'api/ecr/mirror/attendance/sync-bulk'      => [\App\Controllers\Ecr\EcrAttendanceMirrorController::class, 'syncAttendanceBulk'],
+
+        // ── Exam Permit module (phase 3 writes) ──
+        'api/exam-permit/generate' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'generate'],
+        'api/exam-permit/print-status' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'updatePrintStatus'],
     ],
 ];
