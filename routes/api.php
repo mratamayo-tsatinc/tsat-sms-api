@@ -163,6 +163,9 @@ return [
 		'api/exam-permit/permit'    => [\App\Controllers\ExamPermit\ExamPermitController::class, 'permit'],
         'api/exam-permit/latest-issued' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssued'],
         'api/exam-permit/moodle-eligibility' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'moodleEligibility'],
+        'api/exam-permit/policy-admin/bootstrap' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policyAdminBootstrap'],
+        'api/exam-permit/policy-admin/audit' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policyAuditTrail'],
+        'api/exam-permit/policies' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policies'],
     ],
     'POST' => [
         'api/admission/store'        => [\App\Controllers\AdmissionController::class,   'store'],
@@ -286,5 +289,9 @@ return [
         // ── Exam Permit module (phase 3 writes) ──
         'api/exam-permit/generate' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'generate'],
         'api/exam-permit/print-status' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'updatePrintStatus'],
+		'api/exam-permit/policies/save' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'savePolicy'],
+		'api/exam-permit/policies/enable' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'setPolicyEnabled'],
+		'api/exam-permit/policies/reorder-groups' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'reorderPolicyGroups'],
+		'api/exam-permit/policies/reorder-rules' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'reorderPolicyRules'],
     ],
 ];

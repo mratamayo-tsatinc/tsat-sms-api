@@ -4,6 +4,7 @@ namespace App\Controllers\ExamPermit;
 
 use App\Services\ExamPermitReferenceDataService;
 use App\Services\ExamPermitWorkflowService;
+use App\Services\ExamPermitPolicyAdminService;
 
 /**
  * Exam Permit module controller.
@@ -203,6 +204,131 @@ class ExamPermitController
                 return;
             }
 
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/policy-admin/bootstrap?academicYear=optional&semester=optional
+     */
+    public function policyAdminBootstrap()
+    {
+        try {
+            $result = (new ExamPermitPolicyAdminService())->bootstrap([
+                'academicYear' => $_GET['academicYear'] ?? '',
+                'semester' => $_GET['semester'] ?? '',
+            ]);
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/policies
+     */
+    public function policies()
+    {
+        try {
+            $result = (new ExamPermitPolicyAdminService())->listPolicies();
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/policy-admin/audit?policyID=optional&limit=optional
+     */
+    public function policyAuditTrail()
+    {
+        try {
+            $result = (new ExamPermitPolicyAdminService())->policyAuditTrail([
+                'policyID' => $_GET['policyID'] ?? '',
+                'limit' => $_GET['limit'] ?? 40,
+            ]);
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * POST /api/exam-permit/policies/save
+     */
+    public function savePolicy()
+    {
+        try {
+            $body = $this->_readJsonBody();
+            $result = (new ExamPermitPolicyAdminService())->savePolicy($body);
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                http_response_code($code === 'VALIDATION_ERROR' ? 400 : 500);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to save policy.')]]);
+                return;
+            }
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * POST /api/exam-permit/policies/enable
+     */
+    public function setPolicyEnabled()
+    {
+        try {
+            $body = $this->_readJsonBody();
+            $result = (new ExamPermitPolicyAdminService())->setPolicyEnabled($body);
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                http_response_code($code === 'VALIDATION_ERROR' ? 400 : 500);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to update policy status.')]]);
+                return;
+            }
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * POST /api/exam-permit/policies/reorder-groups
+     */
+    public function reorderPolicyGroups()
+    {
+        try {
+            $body = $this->_readJsonBody();
+            $result = (new ExamPermitPolicyAdminService())->reorderGroups($body);
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                http_response_code($code === 'VALIDATION_ERROR' ? 400 : 500);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to reorder groups.')]]);
+                return;
+            }
+            echo json_encode($result);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * POST /api/exam-permit/policies/reorder-rules
+     */
+    public function reorderPolicyRules()
+    {
+        try {
+            $body = $this->_readJsonBody();
+            $result = (new ExamPermitPolicyAdminService())->reorderRules($body);
+            if (!$result['ok']) {
+                $code = (string)($result['code'] ?? 'SERVER_ERROR');
+                http_response_code($code === 'VALIDATION_ERROR' ? 400 : 500);
+                echo json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => (string)($result['message'] ?? 'Unable to reorder rules.')]]);
+                return;
+            }
             echo json_encode($result);
         } catch (\Throwable $e) {
             $this->_serverError($e);
