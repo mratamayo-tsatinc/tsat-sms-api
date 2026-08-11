@@ -161,6 +161,14 @@ return [
 		'api/exam-permit/bootstrap' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'bootstrap'],
 		'api/exam-permit/students'  => [\App\Controllers\ExamPermit\ExamPermitController::class, 'students'],
 		'api/exam-permit/permit'    => [\App\Controllers\ExamPermit\ExamPermitController::class, 'permit'],
+		// Public, cross-origin, unauthenticated — powers ep-temp.html's
+		// QR-verification page. Takes the SAME encrypted `d` token already
+		// embedded in the printed QR (no change to what the QR encodes);
+		// decrypts it server-side and returns the subjects/attendance list
+		// the QR payload itself deliberately omits. See
+		// ExamPermitController::verifyTemporaryPermit() for the full
+		// rationale and trust model.
+		'api/exam-permit/verify'    => [\App\Controllers\ExamPermit\ExamPermitController::class, 'verifyTemporaryPermit'],
     ],
     'POST' => [
         'api/admission/store'        => [\App\Controllers\AdmissionController::class,   'store'],
