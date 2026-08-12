@@ -108,3 +108,4 @@ CREATE TABLE tblPrograms (
   modifiedBy          VARCHAR(35),
   lastModified        VARCHAR(25)
 ) ROW_FORMAT=DYNAMIC;
+
