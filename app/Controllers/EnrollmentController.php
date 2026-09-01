@@ -1033,7 +1033,11 @@ class EnrollmentController
                 s.firstName,
                 s.middleName,
                 s.middleInitial,
-                s.gender
+                s.gender,
+                s.address,
+                s.barangay,
+                s.city_municipality,
+                s.province
             FROM tblRegistrations r
             LEFT JOIN tblPrograms p   ON p.programID   = r.programID
             LEFT JOIN tblSections sec ON sec.sectionID = r.sectionID
@@ -1075,6 +1079,7 @@ class EnrollmentController
                 'studentNumber'      => (string)($row['studentNumber'] ?? ''),
                 'fullName'           => $this->_rosterStudentName($row),
                 'gender'             => (string)($row['gender'] ?? ''),
+                'address'            => $this->_rosterStudentAddress($row),
                 'dateRegistered'     => (string)($row['dateCreated'] ?? ''),
             ];
         }
@@ -1247,6 +1252,23 @@ class EnrollmentController
     private function _rosterStudentName(array $row): string
     {
         return (new ReferenceDataService())->buildStudentFullName($row);
+    }
+
+    // Builds a single display-ready address string from the student's
+    // address line 1 plus barangay/city/province. Blank components are
+    // dropped rather than left as stray ", ," gaps. Roster-only for now —
+    // not yet shared with AdmissionController, which still surfaces these
+    // fields separately.
+    private function _rosterStudentAddress(array $row): string
+    {
+        $parts = [
+            trim((string)($row['address'] ?? '')),
+            trim((string)($row['barangay'] ?? '')),
+            trim((string)($row['city_municipality'] ?? '')),
+            trim((string)($row['province'] ?? '')),
+        ];
+        $parts = array_filter($parts, fn($p) => $p !== '');
+        return implode(', ', $parts);
     }
 
     private function _yearLevelDigits(string $yearLevel): string
