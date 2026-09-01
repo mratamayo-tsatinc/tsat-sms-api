@@ -1080,6 +1080,9 @@ class EnrollmentController
                 'fullName'           => $this->_rosterStudentName($row),
                 'gender'             => (string)($row['gender'] ?? ''),
                 'address'            => $this->_rosterStudentAddress($row),
+                'barangay'           => $this->_rosterAddressComponent($row['barangay'] ?? ''),
+                'cityMunicipality'   => $this->_rosterAddressComponent($row['city_municipality'] ?? ''),
+                'province'           => $this->_rosterAddressComponent($row['province'] ?? ''),
                 'dateRegistered'     => (string)($row['dateCreated'] ?? ''),
             ];
         }
@@ -1279,6 +1282,17 @@ class EnrollmentController
         $parts = array_filter($parts, [$this, '_isUsableAddressPart']);
         $parts = array_map([$this, '_titleCaseAddressPart'], $parts);
         return implode(', ', $parts);
+    }
+
+    // Normalizes a single address component (barangay / city-municipality /
+    // province) for standalone column display: applies the same junk-check
+    // and title-casing used by _rosterStudentAddress(), but returns just
+    // that one field (or '' if it's junk) instead of a joined string.
+    private function _rosterAddressComponent($v): string
+    {
+        $v = (string)($v ?? '');
+        if (!$this->_isUsableAddressPart($v)) return '';
+        return $this->_titleCaseAddressPart($v);
     }
 
     // A part is usable only if it has at least two real (letter/digit)
