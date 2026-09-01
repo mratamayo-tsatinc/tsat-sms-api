@@ -1259,16 +1259,64 @@ class EnrollmentController
     // dropped rather than left as stray ", ," gaps. Roster-only for now —
     // not yet shared with AdmissionController, which still surfaces these
     // fields separately.
+    // Builds a single display-ready address string from the student's
+    // address line 1 plus barangay/city/province. Junk components — blank,
+    // punctuation-only (e.g. "."), single characters, or "NA"/"N/A" in any
+    // casing/spacing — are dropped entirely rather than left as stray gaps,
+    // so the string starts at the first genuinely usable field. Source data
+    // casing is not trusted (mixed upper/lower/all-caps in the DB), so every
+    // surviving part is normalized to title case before joining.
+    // Roster-only for now — not yet shared with AdmissionController, which
+    // still surfaces these fields separately and un-normalized.
     private function _rosterStudentAddress(array $row): string
     {
         $parts = [
-            trim((string)($row['address'] ?? '')),
-            trim((string)($row['barangay'] ?? '')),
-            trim((string)($row['city_municipality'] ?? '')),
-            trim((string)($row['province'] ?? '')),
+            (string)($row['address'] ?? ''),
+            (string)($row['barangay'] ?? ''),
+            (string)($row['city_municipality'] ?? ''),
+            (string)($row['province'] ?? ''),
         ];
-        $parts = array_filter($parts, fn($p) => $p !== '');
+        $parts = array_filter($parts, [$this, '_isUsableAddressPart']);
+        $parts = array_map([$this, '_titleCaseAddressPart'], $parts);
         return implode(', ', $parts);
+    }
+
+    // A part is usable only if it has at least two real (letter/digit)
+    // characters once punctuation and whitespace are stripped, and isn't
+    // some spelling of "N/A". This catches ".", "-", single letters, "NA",
+    // "N/A", "N.A.", etc. without needing an exhaustive blocklist.
+    private function _isUsableAddressPart(string $v): bool
+    {
+        $v = trim($v);
+        if ($v === '') return false;
+        $stripped = preg_replace('/[^A-Za-z0-9]/', '', $v);
+        if ($stripped === '' || mb_strlen($stripped) < 2) return false;
+        if (strcasecmp($stripped, 'NA') === 0) return false;
+        return true;
+    }
+
+    // Normalizes a raw, case-inconsistent address fragment (e.g. all-caps
+    // from legacy imports) into title case, keeping short connector words
+    // ("of", "de", "la", ...) lowercase when they're not the first word —
+    // e.g. "CITY OF TARLAC" -> "City of Tarlac" rather than "City Of Tarlac".
+    private function _titleCaseAddressPart(string $v): string
+    {
+        $v = trim($v);
+        $lowercaseWords = ['of', 'de', 'del', 'la', 'las', 'los', 'y', 'and', 'the'];
+        $tokens = preg_split('/(\s+)/u', $v, -1, PREG_SPLIT_DELIM_CAPTURE);
+        $out = '';
+        $wordIndex = 0;
+        foreach ($tokens as $token) {
+            if (trim($token) === '') { $out .= $token; continue; }
+            $bare = rtrim(mb_strtolower($token, 'UTF-8'), '.,');
+            if ($wordIndex > 0 && in_array($bare, $lowercaseWords, true)) {
+                $out .= mb_strtolower($token, 'UTF-8');
+            } else {
+                $out .= mb_convert_case($token, MB_CASE_TITLE, 'UTF-8');
+            }
+            $wordIndex++;
+        }
+        return $out;
     }
 
     private function _yearLevelDigits(string $yearLevel): string
