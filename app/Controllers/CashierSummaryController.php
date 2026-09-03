@@ -899,6 +899,9 @@ class CashierSummaryController
         $records = [];
         $grandTotal = 0.0;
         $byCashier = [];
+        $byPaymentMethod = [];
+        $referenceData = new \App\Services\ReferenceDataService();
+        $methodLabels = $referenceData->getPaymentMethodLabels();
 
         foreach ($paymentRows as $payment) {
             // createdBy / display resolution stay as-is; SQL has already
@@ -919,6 +922,10 @@ class CashierSummaryController
             $studentDisplayName = $displayNameByStudent[$studentNumber] ?? '(Unknown Student)';
             $createdByDisplayName = $displayNameByEmail[$createdBy] ?? $createdBy;
 
+            // Blank/NULL paymentMethod is treated as CASH on every read path (standing rule).
+            $methodCode = $referenceData->resolvePaymentMethodCode($payment['paymentMethod'] ?? null);
+            $methodLabel = $methodLabels[$methodCode] ?? $methodCode;
+
             $grandTotal += $amountPaid;
 
             $records[] = [
@@ -930,6 +937,9 @@ class CashierSummaryController
                 'createdByDisplayName' => $createdByDisplayName,
                 'paymentDateDisplay'   => $this->_buildPaymentDateDisplay($payment),
                 'dateCreatedDisplay'   => (string)($payment['dateCreated'] ?? ''),
+                'paymentMethod'        => $methodCode,
+                'paymentMethodLabel'   => $methodLabel,
+                'paymentReference'     => (string)($payment['paymentReference'] ?? ''),
             ];
 
             if ($wantAll) {
@@ -940,6 +950,14 @@ class CashierSummaryController
                 $byCashier[$key]['count']++;
                 $byCashier[$key]['total'] += $amountPaid;
             }
+
+            // Payment-method breakdown mirrors byCashier's shape, but is
+            // always computed — it's an orthogonal axis, not admin-only.
+            if (!isset($byPaymentMethod[$methodCode])) {
+                $byPaymentMethod[$methodCode] = ['displayName' => $methodLabel, 'count' => 0, 'total' => 0.0];
+            }
+            $byPaymentMethod[$methodCode]['count']++;
+            $byPaymentMethod[$methodCode]['total'] += $amountPaid;
         }
 
         usort($records, fn($a, $b) => strcmp($a['studentDisplayName'], $b['studentDisplayName']));
@@ -947,6 +965,14 @@ class CashierSummaryController
         $byCashierOut = [];
         foreach ($byCashier as $key => $entry) {
             $byCashierOut[$key] = [
+                'displayName' => $entry['displayName'], 'count' => $entry['count'],
+                'total' => number_format($entry['total'], 2, '.', ''),
+            ];
+        }
+
+        $byPaymentMethodOut = [];
+        foreach ($byPaymentMethod as $key => $entry) {
+            $byPaymentMethodOut[$key] = [
                 'displayName' => $entry['displayName'], 'count' => $entry['count'],
                 'total' => number_format($entry['total'], 2, '.', ''),
             ];
@@ -961,6 +987,7 @@ class CashierSummaryController
             ],
             'grandTotal' => number_format($grandTotal, 2, '.', ''),
             'count' => count($records), 'records' => $records, 'byCashier' => $byCashierOut,
+            'byPaymentMethod' => $byPaymentMethodOut,
             'generatedAt' => date('Y-m-d H:i:s'), 'generatedBy' => $this->_resolveUserDisplayName($db, $email),
             'message' => count($records) . ' payment record(s) found.',
         ]);
