@@ -819,12 +819,20 @@ class CashierSummaryController
         }
 
         $db = Database::getConnection();
+        $referenceData = new \App\Services\ReferenceDataService();
         $isAdmin = $this->_isAdmin($email);
         // Server-side override for non-admins — never trust a client cashierFilter.
         // Computed BEFORE the main query (unlike the plan's original draft),
         // so it can be pushed into the SQL WHERE clause below.
         $effectiveCashier = $isAdmin ? (trim($_GET['cashierFilter'] ?? '') ?: '__ALL__') : $email;
         $wantAll = $effectiveCashier === '__ALL__';
+
+        // Payment-method filter — blank/'__ALL__' means no restriction.
+        // Blank/NULL paymentMethod on a row is still treated as CASH (Principle 3),
+        // so filtering to CASH must also match legacy rows with no stored value.
+        $paymentMethodFilterRaw = trim($_GET['paymentMethodFilter'] ?? '') ?: '__ALL__';
+        $wantAllMethods = $paymentMethodFilterRaw === '__ALL__';
+        $paymentMethodFilterCode = $wantAllMethods ? '' : $referenceData->resolvePaymentMethodCode($paymentMethodFilterRaw);
 
         // ── SQL-level filtering — the performance fix. Both the date
         //    bound AND the cashier filter are pushed into WHERE now,
@@ -855,15 +863,48 @@ class CashierSummaryController
             $params[] = $effectiveCashier;
         }
 
+        // Kept separate from $conditions/$params so a pre-migration "unknown
+        // column" failure (see catch block below) can retry without it.
+        $paymentMethodConditionSql = null;
+        if (!$wantAllMethods) {
+            $paymentMethodConditionSql = $paymentMethodFilterCode === 'CASH'
+                ? "(p.paymentMethod IS NULL OR p.paymentMethod = '' OR p.paymentMethod = 'CASH')"
+                : 'p.paymentMethod = ?';
+        }
+
+        $conditionsWithMethod = $conditions;
+        $paramsWithMethod = $params;
+        if ($paymentMethodConditionSql !== null) {
+            $conditionsWithMethod[] = $paymentMethodConditionSql;
+            if ($paymentMethodFilterCode !== 'CASH') { $paramsWithMethod[] = $paymentMethodFilterCode; }
+        }
+
         $sql = "
             SELECT p.*, r.studentNumber
             FROM tblPayments p
             LEFT JOIN tblRegistrations r ON r.RegistrationNumber = p.registrationNumber
-            WHERE " . implode(' AND ', $conditions);
+            WHERE " . implode(' AND ', $conditionsWithMethod);
 
-        $stmt = $db->prepare($sql);
-        $stmt->execute($params);
-        $paymentRows = $stmt->fetchAll();
+        try {
+            $stmt = $db->prepare($sql);
+            $stmt->execute($paramsWithMethod);
+            $paymentRows = $stmt->fetchAll();
+        } catch (\PDOException $e) {
+            if ($e->getCode() !== '42S22' || $paymentMethodConditionSql === null) throw $e;
+            // tblPayments.paymentMethod doesn't exist yet (migration not applied) —
+            // every row is implicitly Cash; a non-cash filter can only match zero rows.
+            if ($paymentMethodFilterCode === 'CASH') {
+                $fallbackStmt = $db->prepare("
+                    SELECT p.*, r.studentNumber
+                    FROM tblPayments p
+                    LEFT JOIN tblRegistrations r ON r.RegistrationNumber = p.registrationNumber
+                    WHERE " . implode(' AND ', $conditions));
+                $fallbackStmt->execute($params);
+                $paymentRows = $fallbackStmt->fetchAll();
+            } else {
+                $paymentRows = [];
+            }
+        }
 
         // Batch-resolve student display names ONCE via WHERE ... IN (...)
         // instead of a per-row lookup.
@@ -899,6 +940,8 @@ class CashierSummaryController
         $records = [];
         $grandTotal = 0.0;
         $byCashier = [];
+        $byPaymentMethod = [];
+        $methodLabels = $referenceData->getPaymentMethodLabels();
 
         foreach ($paymentRows as $payment) {
             // createdBy / display resolution stay as-is; SQL has already
@@ -919,6 +962,10 @@ class CashierSummaryController
             $studentDisplayName = $displayNameByStudent[$studentNumber] ?? '(Unknown Student)';
             $createdByDisplayName = $displayNameByEmail[$createdBy] ?? $createdBy;
 
+            // Blank/NULL paymentMethod is treated as CASH on every read path (standing rule).
+            $methodCode = $referenceData->resolvePaymentMethodCode($payment['paymentMethod'] ?? null);
+            $methodLabel = $methodLabels[$methodCode] ?? $methodCode;
+
             $grandTotal += $amountPaid;
 
             $records[] = [
@@ -930,6 +977,9 @@ class CashierSummaryController
                 'createdByDisplayName' => $createdByDisplayName,
                 'paymentDateDisplay'   => $this->_buildPaymentDateDisplay($payment),
                 'dateCreatedDisplay'   => (string)($payment['dateCreated'] ?? ''),
+                'paymentMethod'        => $methodCode,
+                'paymentMethodLabel'   => $methodLabel,
+                'paymentReference'     => (string)($payment['paymentReference'] ?? ''),
             ];
 
             if ($wantAll) {
@@ -940,6 +990,14 @@ class CashierSummaryController
                 $byCashier[$key]['count']++;
                 $byCashier[$key]['total'] += $amountPaid;
             }
+
+            // Payment-method breakdown mirrors byCashier's shape, but is
+            // always computed — it's an orthogonal axis, not admin-only.
+            if (!isset($byPaymentMethod[$methodCode])) {
+                $byPaymentMethod[$methodCode] = ['displayName' => $methodLabel, 'count' => 0, 'total' => 0.0];
+            }
+            $byPaymentMethod[$methodCode]['count']++;
+            $byPaymentMethod[$methodCode]['total'] += $amountPaid;
         }
 
         usort($records, fn($a, $b) => strcmp($a['studentDisplayName'], $b['studentDisplayName']));
@@ -952,15 +1010,25 @@ class CashierSummaryController
             ];
         }
 
+        $byPaymentMethodOut = [];
+        foreach ($byPaymentMethod as $key => $entry) {
+            $byPaymentMethodOut[$key] = [
+                'displayName' => $entry['displayName'], 'count' => $entry['count'],
+                'total' => number_format($entry['total'], 2, '.', ''),
+            ];
+        }
+
         echo json_encode([
             'ok' => true,
             'filters' => [
                 'dateMode' => $dateMode, 'rangeType' => $rangeType,
                 'date' => $singleDate, 'startDate' => $startDate, 'endDate' => $endDate,
                 'cashierFilter' => $effectiveCashier, 'isAdmin' => $isAdmin,
+                'paymentMethodFilter' => $wantAllMethods ? '__ALL__' : $paymentMethodFilterCode,
             ],
             'grandTotal' => number_format($grandTotal, 2, '.', ''),
             'count' => count($records), 'records' => $records, 'byCashier' => $byCashierOut,
+            'byPaymentMethod' => $byPaymentMethodOut,
             'generatedAt' => date('Y-m-d H:i:s'), 'generatedBy' => $this->_resolveUserDisplayName($db, $email),
             'message' => count($records) . ' payment record(s) found.',
         ]);

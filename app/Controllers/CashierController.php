@@ -399,6 +399,31 @@ class CashierController
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // GET /api/cashier/payment-methods
+    //
+    // Returns the payment methods currently offered to the cashier — the
+    // join of ref_lookup_values (PAYMENT_METHOD, active) against
+    // tblPaymentMethodAccounts (active). A method with no active mapping
+    // (e.g. CHECK, until a settlement account is assigned) is simply
+    // absent from this list. Read-only; no admin UI backs this in this phase.
+    // ─────────────────────────────────────────────────────────────────────
+    public function paymentMethods()
+    {
+        $referenceData = new \App\Services\ReferenceDataService();
+        $methodAccounts = $referenceData->getActivePaymentMethodAccounts();
+
+        $methods = [];
+        foreach ($methodAccounts as $code => $details) {
+            $methods[] = [
+                'code'  => $code,
+                'label' => $details['label'],
+            ];
+        }
+
+        echo json_encode(['ok' => true, 'methods' => $methods]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // POST /api/cashier/payments
     // ─────────────────────────────────────────────────────────────────────
 
@@ -440,6 +465,7 @@ class CashierController
         $lines              = is_array($input['lines'] ?? null) ? $input['lines'] : [];
         $localORNumber      = trim((string)($input['localORNumber'] ?? ''));
         $createdBy          = trim((string)($input['createdBy'] ?? ''));
+        $paymentReferenceInput = trim((string)($input['paymentReference'] ?? ''));
 
         // ── Basic validation ─────────────────────────────────────────────────────────
         if ($studentNumber === '')      { http_response_code(400); echo json_encode(['error' => 'Student number is required.']); return; }
@@ -469,6 +495,47 @@ class CashierController
             http_response_code(422);
             echo json_encode(['error' => $e->getMessage()]);
             return;
+        }
+
+        // ── Payment method / settlement account resolution (blank input = CASH) ──
+        // getActivePaymentMethodAccounts() degrades to [] if the payment-method
+        // tables haven't been migrated yet. CASH must never be blocked by that —
+        // only non-cash methods require a resolved mapping to proceed.
+        $paymentMethodCode = $referenceData->resolvePaymentMethodCode($input['paymentMethod'] ?? '');
+        $methodAccounts = $referenceData->getActivePaymentMethodAccounts();
+        $settlementAccountCode = $methodAccounts[$paymentMethodCode]['settlementAccountCode'] ?? null;
+
+        if ($paymentMethodCode === 'CASH') {
+            // Cash never carries a reference number, even if the client sent one.
+            $paymentReferenceToStore = null;
+        } else {
+            if (!isset($methodAccounts[$paymentMethodCode])) {
+                http_response_code(422);
+                echo json_encode(['error' => 'Payment method is not available: ' . $paymentMethodCode]);
+                return;
+            }
+            if ($paymentReferenceInput === '') {
+                http_response_code(422);
+                echo json_encode(['error' => 'A reference number is required for ' . $methodAccounts[$paymentMethodCode]['label'] . ' payments.']);
+                return;
+            }
+            // Duplicate reference check — reject before any writes, mirrors the OR-number guard below.
+            try {
+                $dupRefStmt = $db->prepare("SELECT paymentID FROM tblPayments WHERE paymentReference = ?");
+                $dupRefStmt->execute([$paymentReferenceInput]);
+            } catch (\PDOException $e) {
+                // tblPayments.paymentReference doesn't exist yet (migration not applied) —
+                // reject cleanly rather than crash; CASH is unaffected by this branch.
+                http_response_code(422);
+                echo json_encode(['error' => 'Payment method is not available: ' . $paymentMethodCode]);
+                return;
+            }
+            if ($dupRefStmt->fetch()) {
+                http_response_code(409);
+                echo json_encode(['error' => 'Reference number already used on another payment: ' . $paymentReferenceInput]);
+                return;
+            }
+            $paymentReferenceToStore = $paymentReferenceInput;
         }
 
         $sStmt = $db->prepare("SELECT * FROM tblStudents WHERE studentNumber = ?");
@@ -561,18 +628,38 @@ class CashierController
             $paySeq = \App\Models\SequenceGenerator::reserveIdBlock($db, 'tblPayments', 1);
             $paymentID = \App\Models\SequenceGenerator::formatId('PAY', $paySeq['firstNo'], 8);
 
-            $payStmt = $db->prepare("
-                INSERT INTO tblPayments
-                    (paymentID, ORNumber, registrationNumber, AmountPaid,
-                     PaymentMonthNumber, PaymentMonth, PaymentDay, PaymentYear,
-                     dateCreated, createdBy)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ");
-            $payStmt->execute([
-                $paymentID, $orNumber, $registrationNumber, $amountAllocatedStr,
-                $paymentDate['monthNumber'], $paymentDate['monthName'],
-                $paymentDate['day'], $paymentDate['year'], $now, $createdBy,
-            ]);
+            try {
+                $payStmt = $db->prepare("
+                    INSERT INTO tblPayments
+                        (paymentID, ORNumber, registrationNumber, AmountPaid,
+                         PaymentMonthNumber, PaymentMonth, PaymentDay, PaymentYear,
+                         dateCreated, createdBy, paymentMethod, settlementAccount, paymentReference)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+                $payStmt->execute([
+                    $paymentID, $orNumber, $registrationNumber, $amountAllocatedStr,
+                    $paymentDate['monthNumber'], $paymentDate['monthName'],
+                    $paymentDate['day'], $paymentDate['year'], $now, $createdBy,
+                    $paymentMethodCode, $settlementAccountCode, $paymentReferenceToStore,
+                ]);
+            } catch (\PDOException $e) {
+                if ($e->getCode() !== '42S22') throw $e; // rethrow anything but "unknown column"
+                // tblPayments hasn't been migrated yet — fall back to the
+                // original 10-column insert so Cash payments keep working.
+                $payStmt = $db->prepare("
+                    INSERT INTO tblPayments
+                        (paymentID, ORNumber, registrationNumber, AmountPaid,
+                         PaymentMonthNumber, PaymentMonth, PaymentDay, PaymentYear,
+                         dateCreated, createdBy)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+                $payStmt->execute([
+                    $paymentID, $orNumber, $registrationNumber, $amountAllocatedStr,
+                    $paymentDate['monthNumber'], $paymentDate['monthName'],
+                    $paymentDate['day'], $paymentDate['year'], $now, $createdBy,
+                ]);
+                $paymentMethodCode = null; $settlementAccountCode = null; $paymentReferenceToStore = null;
+            }
 
             // Reserve all payment detail IDs as one block so concurrent
             // transactions never collide even when N > 1.
@@ -610,6 +697,14 @@ class CashierController
 
         $change = $amountTendered - $totalAllocated;
         $createdByDisplayName = $this->_resolveUserDisplayName($db, $createdBy);
+        // Falls back to plain "Cash" labels when the insert fell back to the
+        // legacy schema (paymentMethodCode/settlementAccountCode are null then).
+        $paymentMethodLabelOut = $paymentMethodCode !== null
+            ? ($methodAccounts[$paymentMethodCode]['label'] ?? $paymentMethodCode)
+            : 'Cash';
+        $settlementAccountNameOut = $paymentMethodCode !== null
+            ? ($methodAccounts[$paymentMethodCode]['settlementAccountName'] ?? '')
+            : '';
 
         // Complete response object with all fields used by cashier.html's
         // payment success handler, receipt renderer, and DOM update.
@@ -628,6 +723,11 @@ class CashierController
             'paymentDate'          => $paymentDateDisplay,
             'createdBy'            => $createdBy,
             'createdByDisplayName' => $createdByDisplayName,
+            'paymentMethod'        => $paymentMethodCode,
+            'paymentMethodLabel'   => $paymentMethodLabelOut,
+            'settlementAccount'    => $settlementAccountCode,
+            'settlementAccountName'=> $settlementAccountNameOut,
+            'paymentReference'     => $paymentReferenceToStore,
             'lines'                => $detailRows,
             'message'              => 'Payment recorded. OR: ' . $orNumber,
         ]);
@@ -736,12 +836,18 @@ class CashierController
         ");
         $payStmt->execute([$registrationNumber]);
 
+        $methodLabels = $referenceData->getPaymentMethodLabels();
+
         $records = [];
         foreach ($payStmt->fetchAll() as $row) {
+            $methodCode = $referenceData->resolvePaymentMethodCode($row['paymentMethod'] ?? null);
             $records[] = [
-                'ORNumber'    => (string)($row['ORNumber'] ?? ''),
-                'paymentDate' => $this->_buildPaymentDateDisplay($row),
-                'totalPaid'   => number_format((float)($row['totalPaid'] ?? 0), 2, '.', ''),
+                'ORNumber'           => (string)($row['ORNumber'] ?? ''),
+                'paymentDate'        => $this->_buildPaymentDateDisplay($row),
+                'totalPaid'          => number_format((float)($row['totalPaid'] ?? 0), 2, '.', ''),
+                'paymentMethod'      => $methodCode,
+                'paymentMethodLabel' => $methodLabels[$methodCode] ?? $methodCode,
+                'paymentReference'   => (string)($row['paymentReference'] ?? ''),
             ];
         }
 
@@ -843,6 +949,12 @@ class CashierController
         $change = $amountPaid - $totalAllocated;
         $rawCreatedBy = (string)($payment['createdBy'] ?? '');
 
+        // Blank/NULL paymentMethod is treated as CASH on every read path (standing rule).
+        $methodCode = $referenceData->resolvePaymentMethodCode($payment['paymentMethod'] ?? null);
+        $methodLabels = $referenceData->getPaymentMethodLabels();
+        $settlementAccountNames = $referenceData->getSettlementAccountNames();
+        $settlementAccountCode = (string)($payment['settlementAccount'] ?? '');
+
         echo json_encode([
             'ok'                    => true,
             'paymentID'             => (string)($payment['paymentID'] ?? ''),
@@ -858,6 +970,11 @@ class CashierController
             'paymentDate'           => $this->_buildPaymentDateDisplay($payment),
             'createdBy'             => $rawCreatedBy,
             'createdByDisplayName'  => $this->_resolveUserDisplayName($db, $rawCreatedBy),
+            'paymentMethod'         => $methodCode,
+            'paymentMethodLabel'    => $methodLabels[$methodCode] ?? $methodCode,
+            'settlementAccount'     => $settlementAccountCode,
+            'settlementAccountName' => $settlementAccountNames[$settlementAccountCode] ?? '',
+            'paymentReference'      => (string)($payment['paymentReference'] ?? ''),
             'lines'                 => $lines,
             'message'               => 'Payment history retrieved for OR: ' . $orNumber,
         ]);

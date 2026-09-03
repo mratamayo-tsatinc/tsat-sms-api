@@ -232,7 +232,91 @@ class ReferenceDataService
         }
         return $out;
     }
-	
+
+    // Standing interpretation rule (Cashier Payment Method project):
+    // blank/NULL paymentMethod means CASH — everywhere, forever. Every read
+    // path must apply this before displaying or aggregating a payment row.
+    public function resolvePaymentMethodCode(?string $rawPaymentMethod): string
+    {
+        $code = strtoupper(trim((string)$rawPaymentMethod));
+        return $code === '' ? 'CASH' : $code;
+    }
+
+    // Returns PAYMENT_METHOD code => label for ALL active rows in
+    // ref_lookup_values, regardless of whether they have a settlement
+    // account mapping. Used purely for display on read paths (receipt,
+    // payment history, summary) — never for deciding what the cashier can
+    // select (see getActivePaymentMethodAccounts() for that).
+    public function getPaymentMethodLabels(): array
+    {
+        $db = Database::getConnection();
+        $stmt = $db->query("
+            SELECT code, label FROM ref_lookup_values
+            WHERE category = 'PAYMENT_METHOD' AND isActive = 1
+        ");
+        $out = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $out[(string)$row['code']] = (string)$row['label'];
+        }
+        return $out;
+    }
+
+    // Returns settlementAccountCode => settlementAccountName for all
+    // settlement accounts, active or not — used to render the account name
+    // already snapshotted onto a historical tblPayments row.
+    // Degrades to [] if tblSettlementAccounts doesn't exist yet (migration
+    // 002 not yet applied) — callers must never crash on a missing table.
+    public function getSettlementAccountNames(): array
+    {
+        try {
+            $db = Database::getConnection();
+            $stmt = $db->query("SELECT settlementAccountCode, settlementAccountName FROM tblSettlementAccounts");
+            $out = [];
+            foreach ($stmt->fetchAll() as $row) {
+                $out[(string)$row['settlementAccountCode']] = (string)$row['settlementAccountName'];
+            }
+            return $out;
+        } catch (\PDOException $e) {
+            return [];
+        }
+    }
+
+    // Returns paymentMethodCode => details for methods that are active in
+    // BOTH ref_lookup_values (PAYMENT_METHOD) AND tblPaymentMethodAccounts
+    // (joined to an active tblSettlementAccounts row). This join is the
+    // single source of truth for: (a) which methods the cashier may select,
+    // and (b) which settlement account to snapshot at the moment of payment.
+    // A method absent from this map (e.g. CHECK, unmapped) is not offered.
+    // Degrades to [] if the mapping tables don't exist yet (migration 002 not
+    // yet applied) — CASH-only legacy behavior must keep working regardless.
+    public function getActivePaymentMethodAccounts(): array
+    {
+        try {
+            $db = Database::getConnection();
+            $stmt = $db->query("
+                SELECT r.code, r.label, r.sortOrder,
+                       m.settlementAccountCode, s.settlementAccountName
+                FROM ref_lookup_values r
+                INNER JOIN tblPaymentMethodAccounts m ON m.paymentMethodCode = r.code AND m.isActive = 1
+                INNER JOIN tblSettlementAccounts s ON s.settlementAccountCode = m.settlementAccountCode AND s.isActive = 1
+                WHERE r.category = 'PAYMENT_METHOD' AND r.isActive = 1
+                ORDER BY r.sortOrder
+            ");
+        } catch (\PDOException $e) {
+            return [];
+        }
+        $out = [];
+        foreach ($stmt->fetchAll() as $row) {
+            $out[(string)$row['code']] = [
+                'label'                 => (string)$row['label'],
+                'settlementAccountCode' => (string)$row['settlementAccountCode'],
+                'settlementAccountName' => (string)$row['settlementAccountName'],
+                'sortOrder'             => (int)$row['sortOrder'],
+            ];
+        }
+        return $out;
+    }
+
     // Builds a student display name from a tblStudents-shaped row.
     // Format: "[lastName] [nameExtension], [firstName] [middleName]"
     // Prefers middleName over middleInitial when both are present.

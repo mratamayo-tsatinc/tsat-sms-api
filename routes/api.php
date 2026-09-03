@@ -79,6 +79,10 @@ return [
         'api/cashier/students'            => [\App\Controllers\CashierController::class,     'students'],
         // Outstanding assessment balances for a student in the active term.
         'api/cashier/balances'            => [\App\Controllers\CashierController::class,     'balances'],
+        // Payment methods currently selectable by the cashier (joined against
+        // their active settlement-account mapping — see ReferenceDataService::
+        // getActivePaymentMethodAccounts()).
+        'api/cashier/payment-methods' => [\App\Controllers\CashierController::class, 'paymentMethods'],
 		'api/cashier/payment-history' => [\App\Controllers\CashierController::class, 'paymentHistory'],
 		'api/cashier/receipt'         => [\App\Controllers\CashierController::class, 'receipt'],
 		'api/cashier/summary/bootstrap'   => [\App\Controllers\CashierSummaryController::class, 'bootstrap'],
