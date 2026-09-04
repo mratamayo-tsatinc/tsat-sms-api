@@ -361,7 +361,35 @@ class ExamPermitController
     }
 
 
-    public function policies(){try{$rows=Database::getConnection()->query('SELECT * FROM tblExamPermitPolicies ORDER BY priorityOrder DESC, policyID')->fetchAll();foreach($rows as &$r){$r['appliesToPeriods']=$r['appliesToPeriods']?explode(',',$r['appliesToPeriods']):[];$r['scope']=['scopeType'=>$r['scopeType'],'studentNumber'=>$r['studentNumber'],'programID'=>$r['programID'],'yearLevel'=>$r['yearLevel'],'classCode'=>$r['classCode'],'priorityOrder'=>(int)$r['priorityOrder']];}return $this->_respondContract(['ok'=>true,'policies'=>$rows]);}catch(\Throwable $e){$this->_serverError($e);}}
+    public function policies()
+    {
+        try {
+            $db = Database::getConnection();
+            $rows = $db->query('SELECT * FROM tblExamPermitPolicies ORDER BY priorityOrder DESC, policyID')->fetchAll();
+            // Admin editor needs every rule regardless of isEnabled (so a disabled rule can be
+            // re-enabled) — do not reuse ExamPermitPolicyService::rules(), which is gate-scoped
+            // to isEnabled=1 only.
+            $ruleStmt = $db->prepare('SELECT policyRuleID, ruleType, ruleLabel, feeID, thresholdValue, isNegated, isEnabled, sortOrder FROM tblExamPermitPolicyRules WHERE policyID = :id ORDER BY sortOrder, policyRuleID');
+            foreach ($rows as &$r) {
+                $r['appliesToPeriods'] = $r['appliesToPeriods'] ? explode(',', $r['appliesToPeriods']) : [];
+                $r['scope'] = ['scopeType' => $r['scopeType'], 'studentNumber' => $r['studentNumber'], 'programID' => $r['programID'], 'yearLevel' => $r['yearLevel'], 'classCode' => $r['classCode'], 'priorityOrder' => (int)$r['priorityOrder']];
+                $ruleStmt->execute([':id' => $r['policyID']]);
+                $rules = $ruleStmt->fetchAll();
+                foreach ($rules as &$rule) {
+                    // PDO returns every column as a string; JS treats "0" as truthy, so these
+                    // must be cast to real booleans/numbers before reaching the frontend.
+                    $rule['isNegated'] = (bool)$rule['isNegated'];
+                    $rule['isEnabled'] = (bool)$rule['isEnabled'];
+                    $rule['thresholdValue'] = $rule['thresholdValue'] !== null ? (float)$rule['thresholdValue'] : null;
+                }
+                unset($rule);
+                $r['rules'] = $rules;
+                $r['isEnabled'] = (bool)$r['isEnabled'];
+            }
+            unset($r);
+            return $this->_respondContract(['ok' => true, 'policies' => $rows]);
+        } catch (\Throwable $e) { return $this->_serverError($e); }
+    }
     public function policiesSave(){try{$in=$this->_json();foreach(['policyName','scope','actorEmail'] as $f)if(empty($in[$f]))return $this->_validationError($f.' is required.');$id=(new ExamPermitPolicyService())->save($in);(new ExamPermitAuditService())->writeAudit(empty($in['policyID'])?'POLICY_CREATE':'POLICY_UPDATE','SUCCESS',['permitID'=>$id,'actorEmail'=>$in['actorEmail'],'detail'=>$in['policyName']]);return $this->_respondContract(['ok'=>true,'policyID'=>$id,'message'=>'Policy saved.']);}catch(\InvalidArgumentException $e){return $this->_failContract(400,'RULE_TYPE_NOT_IMPLEMENTED',$e->getMessage());}catch(\Throwable $e){$this->_serverError($e);}}
     public function policiesEnable(){try{$in=$this->_json();$db=Database::getConnection();$s=$db->prepare('UPDATE tblExamPermitPolicies SET isEnabled=:enabled,modifiedBy=:by,lastModified=NOW() WHERE policyID=:id');$s->execute([':enabled'=>!empty($in['isEnabled'])?1:0,':by'=>$in['actorEmail']??null,':id'=>$in['policyID']??'']);if(!$s->rowCount())return $this->_failContract(404,'NOT_FOUND','Policy not found.');(new ExamPermitAuditService())->writeAudit(!empty($in['isEnabled'])?'POLICY_ENABLE':'POLICY_DISABLE','SUCCESS',['actorEmail'=>$in['actorEmail']??null,'detail'=>$in['policyID']]);return $this->_respondContract(['ok'=>true]);}catch(\Throwable $e){$this->_serverError($e);}}
     public function policyAdminBootstrap(){try{$in=$_GET;$term=(new ExamPermitReferenceDataService())->getActiveTerm();$ay=$term['academicYear'];$sem=$term['semester'];$students=(new ExamPermitReferenceDataService())->getTermStudentRoster($ay,$sem);$programs=(new ReferenceDataService())->getAllPrograms();$fees=(new ReferenceDataService())->getActiveFees();$classes=(new ReferenceDataService())->getAllSections();$years=[];foreach($students as $s)$years[$s['yearLevel']]=true;return $this->_respondContract(['ok'=>true,'activeTerm'=>$term,'programs'=>$programs,'yearLevels'=>array_keys($years),'classes'=>array_map(fn($x)=>['classCode'=>$x['label']],$classes),'fees'=>$fees,'students'=>$students]);}catch(\Throwable $e){$this->_serverError($e);}}
