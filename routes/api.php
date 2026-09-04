@@ -55,6 +55,7 @@ return [
         // Exam Permit — read-only contract endpoints used by the officer UI.
         'api/exam-permit/lookup-values'     => [\App\Controllers\ExamPermit\ExamPermitController::class, 'lookupValues'],
         'api/exam-permit/latest-issued'      => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssued'],
+        'api/exam-permit/gate-preview'       => [\App\Controllers\ExamPermit\ExamPermitController::class, 'gatePreview'],
         'api/exam-permit/moodle-eligibility' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'moodleEligibility'],
         'api/exam-permit/policies' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policies'],
         'api/exam-permit/policy-admin/bootstrap' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policyAdminBootstrap'],

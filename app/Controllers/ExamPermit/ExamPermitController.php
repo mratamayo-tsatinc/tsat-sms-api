@@ -293,6 +293,47 @@ class ExamPermitController
         }
     }
 
+    /**
+     * GET /api/exam-permit/gate-preview?studentNumber=...&academicYear=...&semester=...&period=...
+     * Read-only preview of what generate() would decide, WITHOUT creating a
+     * permit and WITHOUT writing a GATE_EVALUATE audit row. Powers the
+     * officer drawer's locked Generate Permit button + inline denial
+     * reason (see "Frontend changes" for exampermit.html) so an officer
+     * sees why generation is blocked before clicking, instead of only
+     * after a failed POST /generate.
+     *
+     * Deliberately audit-silent: a preview fires on every drawer open and
+     * every period switch, which is not itself a meaningful officer
+     * action — the real GATE_EVALUATE row is still written exactly once
+     * per actual generate() call, unchanged from before.
+     *
+     * Calls the identical ExamPermitGateService::evaluateGate() that
+     * generate() calls, so the preview can never disagree with the real
+     * decision made at click time (aside from an intervening watchlist/
+     * policy change between preview and click, which generate() still
+     * re-evaluates and enforces server-side regardless of what the
+     * preview showed).
+     */
+    public function gatePreview()
+    {
+        try {
+            $studentNumber = trim((string)($_GET['studentNumber'] ?? ''));
+            $academicYear  = trim((string)($_GET['academicYear'] ?? ''));
+            $semester      = trim((string)($_GET['semester'] ?? ''));
+            $period        = strtoupper(trim((string)($_GET['period'] ?? '')));
+
+            if ($studentNumber === '' || $academicYear === '' || $semester === '' || $period === '') {
+                $this->_validationError('studentNumber, academicYear, semester, and period are required.');
+                return;
+            }
+
+            $gate = (new ExamPermitGateService())->evaluateGate($studentNumber, $academicYear, $semester, $period);
+            echo json_encode(['ok' => true, 'gate' => $gate]);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
     public function generate()
     {
         try {
