@@ -46,7 +46,7 @@ class ExamPermitPolicyService
         }
         return ['allow'=>true,'message'=>'All policy rules passed.'];
     }
-
+    /*
     public function save(array $input): string
     {
         $db=Database::getConnection(); $scope=$input['scope']??[]; $id=trim((string)($input['policyID']??'')); $new=$id==='';
@@ -55,5 +55,102 @@ class ExamPermitPolicyService
         $db->prepare($sql)->execute([':id'=>$id,':name'=>$input['policyName'],':description'=>$input['description']??null,':ay'=>$input['activeAcademicYear']??null,':sem'=>$input['activeSemester']??null,':periods'=>implode(',',(array)($input['appliesToPeriods']??[])),':scope'=>$scope['scopeType'],':student'=>$scope['studentNumber']??null,':program'=>$scope['programID']??null,':year'=>$scope['yearLevel']??null,':class'=>$scope['classCode']??null,':priority'=>(int)($scope['priorityOrder']??1),':enabled'=>!empty($input['isEnabled'])?1:0,':actor'=>$input['actorEmail']??null]);
         foreach((array)($input['rules']??[]) as $i=>$r){ if(($r['ruleType']??'')==='PROMISSORY_NOTE_ABSENT') throw new \InvalidArgumentException('RULE_TYPE_NOT_IMPLEMENTED'); $rid=trim((string)($r['policyRuleID']??'')); if($rid===''){ $seq=SequenceGenerator::reserveIdBlock($db,'tblExamPermitPolicyRules',1);$rid=SequenceGenerator::formatId('EPRL',$seq['firstNo'],6); $db->prepare("INSERT INTO tblExamPermitPolicyRules (policyRuleID,policyID,ruleType,ruleLabel,feeID,thresholdValue,parameterText,isNegated,sortOrder,isEnabled,createdBy,dateCreated) VALUES (:rid,:pid,:type,:label,:fee,:threshold,:text,:negated,:sort,:enabled,:actor,NOW())")->execute([':rid'=>$rid,':pid'=>$id,':type'=>$r['ruleType'],':label'=>$r['ruleLabel'],':fee'=>$r['feeID']??null,':threshold'=>$r['thresholdValue']??null,':text'=>$r['parameterText']??null,':negated'=>!empty($r['isNegated'])?1:0,':sort'=>$i+1,':enabled'=>!empty($r['isEnabled'])?1:0,':actor'=>$input['actorEmail']??null]); }}
         return $id;
+    }
+    */
+    public function save(array $input): string
+    {
+        $db = Database::getConnection();
+        $scope = $input['scope'] ?? [];
+        $id = trim((string)($input['policyID'] ?? ''));
+        $new = $id === '';
+        $rules = (array)($input['rules'] ?? []);
+
+        // Validate before writing anything — a rejection must not leave a
+        // partially-saved policy header behind.
+        foreach ($rules as $r) {
+            if (($r['ruleType'] ?? '') === 'PROMISSORY_NOTE_ABSENT') {
+                throw new \InvalidArgumentException('RULE_TYPE_NOT_IMPLEMENTED');
+            }
+        }
+
+        $db->beginTransaction();
+        try {
+            if ($new) {
+                $seq = SequenceGenerator::reserveIdBlock($db, 'tblExamPermitPolicies', 1);
+                $id = SequenceGenerator::formatId('EPP', $seq['firstNo'], 7);
+            }
+
+            $sql = $new
+                ? "INSERT INTO tblExamPermitPolicies (policyID,policyName,description,activeAcademicYear,activeSemester,appliesToPeriods,scopeType,studentNumber,programID,yearLevel,classCode,priorityOrder,isEnabled,createdBy,dateCreated) VALUES (:id,:name,:description,:ay,:sem,:periods,:scope,:student,:program,:year,:class,:priority,:enabled,:actor,NOW())"
+                : "UPDATE tblExamPermitPolicies SET policyName=:name,description=:description,activeAcademicYear=:ay,activeSemester=:sem,appliesToPeriods=:periods,scopeType=:scope,studentNumber=:student,programID=:program,yearLevel=:year,classCode=:class,priorityOrder=:priority,isEnabled=:enabled,modifiedBy=:actor,lastModified=NOW() WHERE policyID=:id";
+
+            $db->prepare($sql)->execute([
+                ':id' => $id,
+                ':name' => $input['policyName'],
+                ':description' => $input['description'] ?? null,
+                ':ay' => $input['activeAcademicYear'] ?? null,
+                ':sem' => $input['activeSemester'] ?? null,
+                ':periods' => implode(',', (array)($input['appliesToPeriods'] ?? [])),
+                ':scope' => $scope['scopeType'],
+                ':student' => $scope['studentNumber'] ?? null,
+                ':program' => $scope['programID'] ?? null,
+                ':year' => $scope['yearLevel'] ?? null,
+                ':class' => $scope['classCode'] ?? null,
+                ':priority' => (int)($scope['priorityOrder'] ?? 1),
+                ':enabled' => !empty($input['isEnabled']) ? 1 : 0,
+                ':actor' => $input['actorEmail'] ?? null,
+            ]);
+
+            $keptRuleIDs = [];
+
+            foreach ($rules as $i => $r) {
+                $rid = trim((string)($r['policyRuleID'] ?? ''));
+                $params = [
+                    ':pid' => $id,
+                    ':type' => $r['ruleType'],
+                    ':label' => $r['ruleLabel'],
+                    ':fee' => $r['feeID'] ?? null,
+                    ':threshold' => $r['thresholdValue'] ?? null,
+                    ':text' => $r['parameterText'] ?? null,
+                    ':negated' => !empty($r['isNegated']) ? 1 : 0,
+                    ':sort' => $i + 1,
+                    ':enabled' => !empty($r['isEnabled']) ? 1 : 0,
+                    ':actor' => $input['actorEmail'] ?? null,
+                ];
+
+                if ($rid === '') {
+                    $seq = SequenceGenerator::reserveIdBlock($db, 'tblExamPermitPolicyRules', 1);
+                    $rid = SequenceGenerator::formatId('EPRL', $seq['firstNo'], 6);
+                    $params[':rid'] = $rid;
+                    $db->prepare("INSERT INTO tblExamPermitPolicyRules (policyRuleID,policyID,ruleType,ruleLabel,feeID,thresholdValue,parameterText,isNegated,sortOrder,isEnabled,createdBy,dateCreated) VALUES (:rid,:pid,:type,:label,:fee,:threshold,:text,:negated,:sort,:enabled,:actor,NOW())")
+                        ->execute($params);
+                } else {
+                    $params[':rid'] = $rid;
+                    $db->prepare("UPDATE tblExamPermitPolicyRules SET ruleType=:type,ruleLabel=:label,feeID=:fee,thresholdValue=:threshold,parameterText=:text,isNegated=:negated,sortOrder=:sort,isEnabled=:enabled,modifiedBy=:actor,lastModified=NOW() WHERE policyRuleID=:rid AND policyID=:pid")
+                        ->execute($params);
+                }
+
+                $keptRuleIDs[] = $rid;
+            }
+
+            // Delete rules that existed before this save but were removed
+            // in the UI (never happens for a brand-new policy — nothing to
+            // delete yet).
+            if (!$new) {
+                if ($keptRuleIDs) {
+                    $placeholders = implode(',', array_fill(0, count($keptRuleIDs), '?'));
+                    $db->prepare("DELETE FROM tblExamPermitPolicyRules WHERE policyID = ? AND policyRuleID NOT IN ($placeholders)")
+                        ->execute(array_merge([$id], $keptRuleIDs));
+                } else {
+                    $db->prepare("DELETE FROM tblExamPermitPolicyRules WHERE policyID = ?")->execute([$id]);
+                }
+            }
+
+            $db->commit();
+            return $id;
+        } catch (\Throwable $e) {
+            $db->rollBack();
+            throw $e;
+        }
     }
 }
