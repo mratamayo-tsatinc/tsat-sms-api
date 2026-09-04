@@ -2,6 +2,10 @@
 
 namespace App\Controllers;
 
+use App\Core\Database;
+use App\Services\ExamPermitGateService;
+use App\Services\ExamPermitAuditService;
+
 /**
  * MoodleController
  *
@@ -727,7 +731,8 @@ class MoodleController
 
     // ==================================================================
     // 4.10 updateExamPermitStatusByEmail() — POST /api/moodle/users/exam-permit-status
-    // Body: { email, period: 'PRELIM'|'MIDTERM'|'SEMIFINALS'|'FINALS', active: true|false }
+    // Body: { email, studentNumber, academicYear, semester,
+    // period: 'PRELIM'|'MIDTERM'|'SEMIFINALS'|'FINALS', active: true|false }
     //
     // Writes exactly ONE period's field per call — see
     // _setUserExamPermitCore()'s doc comment for why this is a genuine
@@ -741,13 +746,31 @@ class MoodleController
         try {
             $input  = json_decode(file_get_contents('php://input'), true) ?? [];
             $email  = isset($input['email']) ? trim((string) $input['email']) : '';
+            $studentNumber = isset($input['studentNumber']) ? trim((string) $input['studentNumber']) : '';
+            $academicYear = isset($input['academicYear']) ? trim((string) $input['academicYear']) : '';
+            $semester = isset($input['semester']) ? trim((string) $input['semester']) : '';
             $period = isset($input['period']) ? strtoupper(trim((string) $input['period'])) : '';
             $active = $input['active'] ?? null;
+            $actorEmail = isset($input['actorEmail']) ? trim((string) $input['actorEmail']) : '';
 
-            if ($email === '' || !isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period]) || !is_bool($active)) {
-                $this->_fail(422, 'VALIDATION_ERROR', 'email, a valid period (PRELIM/MIDTERM/SEMIFINALS/FINALS), and a boolean active are required.');
+            if ($email === '' || $studentNumber === '' || $academicYear === '' || $semester === '' || !isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period]) || !is_bool($active) || $actorEmail === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'email, studentNumber, academicYear, semester, a valid period (PRELIM/MIDTERM/SEMIFINALS/FINALS), actorEmail, and a boolean active are required.');
                 return;
             }
+
+            // This write is now audited (MOODLE_ACTIVATE / MOODLE_DEACTIVATE),
+            // matching PRINT/REPRINT/TEMP_PRINT/VOID elsewhere in the module —
+            // this closes the previous audit gap where LMS toggles never
+            // appeared in the audit trail even though the frontend's audit
+            // filter already listed these two action types.
+            $actionType = $active ? 'MOODLE_ACTIVATE' : 'MOODLE_DEACTIVATE';
+            $auditBase = [
+                'studentNumber' => $studentNumber,
+                'academicYear'  => $academicYear,
+                'semester'      => $semester,
+                'period'        => $period,
+                'actorEmail'    => $actorEmail,
+            ];
 
             // Only userId is needed to write — cheaper than
             // _resolveUserExamPermitsCore(), which also parses all four
@@ -762,7 +785,20 @@ class MoodleController
                 return;
             }
             if ($resolved['status'] === 'not_found') {
+                (new ExamPermitAuditService())->writeAudit($actionType, 'FAILED', array_merge($auditBase, ['detail' => 'USER_NOT_FOUND (' . $email . ')']));
                 $this->_respond(200, ['ok' => true, 'updated' => false, 'reason' => 'USER_NOT_FOUND']);
+                return;
+            }
+
+            $gate = $this->_evaluateExamPermitGate($studentNumber, $academicYear, $semester, $period);
+            if ($gate['status'] !== 'ok') {
+                (new ExamPermitAuditService())->writeAudit($actionType, 'DENY', array_merge($auditBase, ['permitID' => $gate['permitID'] ?? null, 'detail' => $gate['message']]));
+                $this->_respond(200, [
+                    'ok'      => true,
+                    'updated' => false,
+                    'reason'  => 'GATE_INELIGIBLE',
+                    'message' => $gate['message'],
+                ]);
                 return;
             }
 
@@ -771,12 +807,18 @@ class MoodleController
             switch ($update['status']) {
                 case 'invalid_period': // defensive only — already validated above
                 case 'invalid':
+                    (new ExamPermitAuditService())->writeAudit($actionType, 'FAILED', array_merge($auditBase, ['permitID' => $gate['permitID'] ?? null, 'detail' => $update['message']]));
                     $this->_fail(422, 'EXAM_PERMIT_UPDATE_INVALID', $update['message']);
                     return;
                 case 'forbidden':
+                    (new ExamPermitAuditService())->writeAudit($actionType, 'FAILED', array_merge($auditBase, ['permitID' => $gate['permitID'] ?? null, 'detail' => $update['message']]));
                     $this->_fail(502, 'MOODLE_FORBIDDEN', $update['message']);
                     return;
                 case 'timeout':
+                    // Transport-level failures are not written to the audit
+                    // trail — same convention as PRINT/TEMP_PRINT, which also
+                    // only ever audit a definite SUCCESS/FAILED/DENY outcome,
+                    // not "we couldn't tell".
                     $this->_fail(504, 'MOODLE_TIMEOUT', $update['message']);
                     return;
                 case 'unavailable':
@@ -784,6 +826,10 @@ class MoodleController
                     return;
                 case 'ok':
                 default:
+                    (new ExamPermitAuditService())->writeAudit($actionType, 'SUCCESS', array_merge($auditBase, [
+                        'permitID' => $gate['permitID'] ?? null,
+                        'detail'   => $period . ' Moodle Exam Permit set to ' . ($active ? 'active' : 'inactive') . '.',
+                    ]));
                     $this->_respond(200, [
                         'ok'      => true,
                         'updated' => true,
@@ -795,6 +841,64 @@ class MoodleController
             }
         } catch (\Throwable $e) {
             $this->_fail(500, 'INTERNAL_ERROR', 'Unexpected error updating Exam Permit status.');
+        }
+    }
+
+    /**
+     * Gate precondition for Moodle exam-permit toggles. This is intentionally
+     * conservative: the permit must already exist as ISSUED for the exact
+     * student/term/period before the Moodle custom field is updated, and the
+     * current gate evaluation must not be denying it. No policy/watchlist
+     * tables exist in this codebase yet, so we validate the minimum durable
+     * precondition the rest of the implementation depends on and fail closed
+     * when there is no issued permit record.
+     *
+     * @return array{status:string,message?:string}
+     */
+    private function _evaluateExamPermitGate(string $studentNumber, string $academicYear, string $semester, string $period): array
+    {
+        try {
+            $db = Database::getConnection();
+            $stmt = $db->prepare(
+                "SELECT permitID
+                 FROM tblExamPermits
+                 WHERE studentNumber = :studentNumber
+                   AND academicYear = :academicYear
+                   AND semester = :semester
+                   AND period = :period
+                   AND status = 'ISSUED'
+                 ORDER BY generatedAt DESC, permitID DESC
+                 LIMIT 1"
+            );
+            $stmt->execute([
+                ':studentNumber' => $studentNumber,
+                ':academicYear'  => $academicYear,
+                ':semester'      => $semester,
+                ':period'        => $period,
+            ]);
+
+            $permitID = $stmt->fetchColumn();
+            if ($permitID === false) {
+                return [
+                    'status'   => 'ineligible',
+                    'permitID' => null,
+                    'message'  => 'No issued Exam Permit exists for this student in the current academic year/semester and period.',
+                ];
+            }
+
+            // permitID travels back up to updateExamPermitStatusByEmail() so
+            // its MOODLE_ACTIVATE/MOODLE_DEACTIVATE audit rows can link back
+            // to the specific permit — same convention PRINT/VOID already
+            // use for their own audit rows.
+            return ['status' => 'ok', 'permitID' => $permitID];
+        } catch (\Throwable $e) {
+            // Gate tables are not yet present in this install; fail closed so a
+            // toggle never reaches Moodle without a valid permit state.
+            return [
+                'status'   => 'ineligible',
+                'permitID' => null,
+                'message'  => 'Exam Permit gating is not available for this student/term/period.',
+            ];
         }
     }
 
@@ -1058,21 +1162,6 @@ class MoodleController
         return $examPermits;
     }
 
-    /**
-     * Bulk sibling of _resolveUserExamPermitsCore() — resolves MANY users
-     * by email and extracts all four Exam Permit customfields for each,
-     * in ONE core_user_get_users_by_field call. Moodle's 'values' param
-     * already accepts an array (the single-user core above just always
-     * passed a one-element array); the only new work here is matching
-     * each returned user back to the email that was requested, since
-     * Moodle silently OMITS any email it can't find rather than
-     * returning a placeholder for it — so every requested email that
-     * doesn't come back in the response is resolved as not-found here,
-     * not left unanswered.
-     *
-     * @param string[] $emails
-     * @return array{status:string,results?:array<string,array{found:bool,userId:?int,examPermits:?array}>,message?:string}
-     */
     private function _resolveUserExamPermitsBulkCore(array $emails): array
     {
         $result = $this->_callMoodleWs(self::WSFUNCTION_RESOLVE_USER, [
@@ -1080,53 +1169,17 @@ class MoodleController
             'values' => $emails,
         ]);
 
-        if ($result['type'] === 'timeout') {
-            return ['status' => 'timeout', 'message' => $result['message']];
-        }
-        if ($result['type'] === 'transport') {
-            return ['status' => 'unavailable', 'message' => $result['message']];
-        }
-        if ($result['type'] === 'exception') {
-            // Same rationale as _resolveUserExamPermitsCore(): no
-            // documented "not found" exception for this WS function —
-            // Moodle just omits unmatched emails from the returned array.
-            return ['status' => 'unavailable', 'message' => $result['message']];
-        }
-
-        // $result['type'] === 'success' — a bare JSON array of user
-        // objects, one per email Moodle actually matched. Order is not
-        // guaranteed to follow the request, and unmatched emails are
-        // simply absent rather than null-padded.
+        if ($result['type'] === 'timeout') return ['status' => 'timeout', 'message' => $result['message']];
+        if ($result['type'] === 'transport' || $result['type'] === 'exception') return ['status' => 'unavailable', 'message' => $result['message']];
         $users = is_array($result['data']) ? $result['data'] : [];
-
-        // Moodle matches email case-insensitively, so key the lookup map
-        // the same way to avoid missing a match over a casing difference
-        // between what we stored and what's on the Moodle account.
-        $userByLowerEmail = [];
-        foreach ($users as $u) {
-            if (isset($u['email'])) {
-                $userByLowerEmail[strtolower((string) $u['email'])] = $u;
-            }
-        }
-
-        $results = [];
+        $byEmail = [];
+        foreach ($users as $user) if (isset($user['email'])) $byEmail[strtolower((string)$user['email'])] = $user;
+        $out = [];
         foreach ($emails as $email) {
-            $user = $userByLowerEmail[strtolower($email)] ?? null;
-
-            if ($user === null) {
-                $results[$email] = ['found' => false, 'userId' => null, 'examPermits' => null];
-                continue;
-            }
-
-            $customFields = is_array($user['customfields'] ?? null) ? $user['customfields'] : [];
-            $results[$email] = [
-                'found'       => true,
-                'userId'      => (int) $user['id'],
-                'examPermits' => $this->_extractExamPermitsFromCustomFields($customFields),
-            ];
+            $user = $byEmail[strtolower($email)] ?? null;
+            $out[$email] = $user ? ['found'=>true,'userId'=>(int)$user['id'],'examPermits'=>$this->_extractExamPermitsFromCustomFields(is_array($user['customfields']??null)?$user['customfields']:[])] : ['found'=>false,'userId'=>null,'examPermits'=>null];
         }
-
-        return ['status' => 'ok', 'results' => $results];
+        return ['status'=>'ok','results'=>$out];
     }
 
     /**
