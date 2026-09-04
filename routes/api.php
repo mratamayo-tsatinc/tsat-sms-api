@@ -52,6 +52,15 @@ return [
         // already returns every customfield on the user record).
         'api/moodle/users/exam-permit-status'             => [\App\Controllers\MoodleController::class, 'examPermitStatusByEmail'],
 
+        // Exam Permit — read-only contract endpoints used by the officer UI.
+        'api/exam-permit/lookup-values'     => [\App\Controllers\ExamPermit\ExamPermitController::class, 'lookupValues'],
+        'api/exam-permit/latest-issued'      => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssued'],
+        'api/exam-permit/moodle-eligibility' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'moodleEligibility'],
+        'api/exam-permit/policies' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policies'],
+        'api/exam-permit/policy-admin/bootstrap' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policyAdminBootstrap'],
+        'api/exam-permit/policy-admin/audit' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policyAudit'],
+        'api/exam-permit/watchlist' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'watchlist'],
+
         // ── Accounts module ──
         // Reference/lookup endpoints aliased to EnrollmentController —
         // tblFees, tblSections, tblPrograms, tblStudents are shared,
@@ -217,6 +226,14 @@ return [
         // customfields as a partial update, so this never touches the
         // other three periods). Body: { email, period, active }.
         'api/moodle/users/exam-permit-status' => [\App\Controllers\MoodleController::class, 'updateExamPermitStatusByEmail'],
+
+        'api/exam-permit/generate' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'generate'],
+        'api/exam-permit/print-status' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'printStatus'],
+        'api/exam-permit/void' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'void'],
+        'api/exam-permit/policies/save' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policiesSave'],
+        'api/exam-permit/policies/enable' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policiesEnable'],
+        'api/exam-permit/watchlist/add' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'watchlistAdd'],
+        'api/exam-permit/watchlist/remove' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'watchlistRemove'],
 
         // Exam Permit — bulk READ of all 4 periods for MANY students in
         // one Moodle round trip (core_user_get_users_by_field accepts an

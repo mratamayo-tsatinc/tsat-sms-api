@@ -2,7 +2,14 @@
 
 namespace App\Controllers\ExamPermit;
 
+use App\Core\Database;
 use App\Services\ExamPermitReferenceDataService;
+use App\Services\ReferenceDataService;
+use App\Services\ExamPermitAuditService;
+use App\Services\ExamPermitGateService;
+use App\Services\ExamPermitPolicyService;
+use App\Services\ExamPermitWatchlistService;
+use App\Models\SequenceGenerator;
 
 /**
  * Exam Permit module controller.
@@ -190,6 +197,195 @@ class ExamPermitController
             $this->_serverError($e);
         }
     }
+
+    /**
+     * GET /api/exam-permit/lookup-values?category=
+     * Returns active ref_lookup_values entries for this module's categories.
+     */
+    public function lookupValues()
+    {
+        try {
+            $allowed = ['EXAM_PERMIT_VOID_REASON', 'EXAM_PERMIT_LISTTYPE_LABEL', 'EXAM_PERMIT_PERIOD_LABEL'];
+            $category = strtoupper(trim((string)($_GET['category'] ?? '')));
+
+            if ($category !== '' && !in_array($category, $allowed, true)) {
+                $this->_validationError('category must be one of EXAM_PERMIT_VOID_REASON, EXAM_PERMIT_LISTTYPE_LABEL, EXAM_PERMIT_PERIOD_LABEL.');
+                return;
+            }
+
+            $cats = $category !== '' ? [$category] : $allowed;
+            $values = (new ReferenceDataService())->getLookupValues($cats);
+
+            if ($category !== '') {
+                $values = [$category => $values[$category] ?? []];
+            }
+
+            echo json_encode(['ok' => true, 'values' => $values]);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/latest-issued?studentNumber=...&academicYear=...&semester=...&period=...
+     */
+    public function latestIssued()
+    {
+        try {
+            $studentNumber = trim((string)($_GET['studentNumber'] ?? ''));
+            $academicYear  = trim((string)($_GET['academicYear'] ?? ''));
+            $semester      = trim((string)($_GET['semester'] ?? ''));
+            $period        = trim((string)($_GET['period'] ?? ''));
+
+            if ($studentNumber === '' || $academicYear === '' || $semester === '' || $period === '') {
+                $this->_validationError('studentNumber, academicYear, semester, and period are required.');
+                return;
+            }
+
+            $db = Database::getConnection();
+            $stmt = $db->prepare(
+                "SELECT *
+                 FROM tblExamPermits
+                 WHERE studentNumber = :studentNumber
+                   AND academicYear = :academicYear
+                   AND semester = :semester
+                   AND period = :period
+                 ORDER BY generatedAt DESC, permitID DESC
+                 LIMIT 1"
+            );
+            $stmt->execute([
+                ':studentNumber' => $studentNumber,
+                ':academicYear'  => $academicYear,
+                ':semester'      => $semester,
+                ':period'        => strtoupper($period),
+            ]);
+
+            $permit = $stmt->fetch();
+            echo json_encode(['ok' => true, 'permit' => $permit ?: null]);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * GET /api/exam-permit/moodle-eligibility?studentNumber=...&academicYear=...&semester=...&period=...
+     * This is the same gate precondition used by the Moodle write endpoint. Since this install
+     * does not yet include the full policy/watchlist tables from the later phase, the check resolves
+     * to the minimal durable rule: a permit must already exist as ISSUED and be currently eligible.
+     */
+    public function moodleEligibility()
+    {
+        try {
+            $studentNumber = trim((string)($_GET['studentNumber'] ?? ''));
+            $academicYear  = trim((string)($_GET['academicYear'] ?? ''));
+            $semester      = trim((string)($_GET['semester'] ?? ''));
+            $period        = trim((string)($_GET['period'] ?? ''));
+
+            if ($studentNumber === '' || $academicYear === '' || $semester === '' || $period === '') {
+                $this->_validationError('studentNumber, academicYear, semester, and period are required.');
+                return;
+            }
+
+            $eligibility = (new ExamPermitGateService())->checkMoodleEligibility($studentNumber, $academicYear, $semester, strtoupper($period));
+            echo json_encode(array_merge(['ok' => true], $eligibility));
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    public function generate()
+    {
+        try {
+            $in=$this->_json(); foreach(['studentNumber','academicYear','semester','period','actorEmail'] as $f) if(trim((string)($in[$f]??''))==='') return $this->_validationError($f.' is required.');
+            $in['period']=strtoupper(trim($in['period']));
+            $ref=new ExamPermitReferenceDataService(); $preview=$ref->getStudentExamPermit($in['studentNumber'],$in['academicYear'],$in['semester'],$in['period']);
+            if(!$preview['ok']) return $this->_failContract(422,'VALIDATION_ERROR','Invalid student, term, or period.');
+            $db=Database::getConnection(); $existing=$db->prepare("SELECT * FROM tblExamPermits WHERE studentNumber=:sn AND academicYear=:ay AND semester=:sem AND period=:period AND status='ISSUED' ORDER BY generatedAt DESC, permitID DESC LIMIT 1"); $existing->execute([':sn'=>$in['studentNumber'],':ay'=>$in['academicYear'],':sem'=>$in['semester'],':period'=>$in['period']]); if($row=$existing->fetch()){ return $this->_respondContract(['ok'=>true,'code'=>'ALREADY_ISSUED','permit'=>$row]); }
+            $gate=(new ExamPermitGateService())->evaluateGate($in['studentNumber'],$in['academicYear'],$in['semester'],$in['period']); $audit=new ExamPermitAuditService(); $audit->writeAudit('GATE_EVALUATE',$gate['decision']==='ALLOW'?'ALLOW':'DENY',array_merge($in,['detail'=>$gate]));
+            if($gate['decision']!=='ALLOW'){ $audit->writeAudit('GENERATE','DENY',array_merge($in,['detail'=>$gate['reason']])); return $this->_failContract(200,'GATE_DENIED',$gate['reason'],'GATE_DENIED'); }
+            $db->beginTransaction(); $seq=SequenceGenerator::reserveIdBlock($db,'tblExamPermits',1); $id=SequenceGenerator::formatId('EPM',$seq['firstNo'],7); $db->prepare("INSERT INTO tblExamPermits (permitID,studentNumber,registrationNumber,academicYear,semester,period,status,gateSource,gatePolicyID,gateWatchlistID,gateDecision,gateSummary,generatedBy,generatedAt,printCount) VALUES (:id,:sn,:reg,:ay,:sem,:period,'ISSUED',:source,:policy,:watch,'ALLOW',:summary,:by,NOW(),0)")->execute([':id'=>$id,':sn'=>$in['studentNumber'],':reg'=>$preview['student']['registrationNumber'],':ay'=>$in['academicYear'],':sem'=>$in['semester'],':period'=>$in['period'],':source'=>$gate['source'],':policy'=>$gate['policyID'],':watch'=>$gate['watchlistID'],':summary'=>$gate['reason'],':by'=>$in['actorEmail']]); $audit->writeAudit('GENERATE','SUCCESS',array_merge($in,['permitID'=>$id,'detail'=>$gate])); $db->commit(); return $this->_respondContract(['ok'=>true,'code'=>'GENERATED','permit'=>array_merge(['permitID'=>$id,'studentNumber'=>$in['studentNumber'],'academicYear'=>$in['academicYear'],'semester'=>$in['semester'],'period'=>$in['period'],'status'=>'ISSUED','gateSource'=>$gate['source'],'gatePolicyID'=>$gate['policyID'],'gateWatchlistID'=>$gate['watchlistID'],'gateDecision'=>'ALLOW','printCount'=>0])]);
+        } catch(\Throwable $e){ if(isset($db)&&$db->inTransaction())$db->rollBack(); return $this->_serverError($e); }
+    }
+
+    public function printStatus()
+    {
+        try {
+            $in = $this->_json();
+            if (trim((string)($in['permitID'] ?? '')) === '' || trim((string)($in['actorEmail'] ?? '')) === '') return $this->_validationError('permitID and actorEmail are required.');
+            $db = Database::getConnection();
+            $s = $db->prepare('SELECT * FROM tblExamPermits WHERE permitID=:id'); $s->execute([':id' => $in['permitID']]); $p = $s->fetch();
+            if (!$p) return $this->_failContract(404, 'NOT_FOUND', 'Permit not found.');
+            $wasReprint = (int)$p['printCount'] > 0;
+            if ($this->_policyVersionChanged($p)) {
+                (new ExamPermitAuditService())->writeAudit($wasReprint ? 'REPRINT' : 'PRINT', 'FAILED', ['permitID' => $p['permitID'], 'studentNumber' => $p['studentNumber'], 'period' => $p['period'], 'actorEmail' => $in['actorEmail'], 'detail' => 'POLICY_VERSION_CHANGED']);
+                return $this->_failContract(200, 'POLICY_VERSION_CHANGED', 'The policy used to generate this permit has changed. Void and reissue instead of reprinting.', 'POLICY_VERSION_CHANGED');
+            }
+            $count = (int)$p['printCount'] + 1;
+            $db->prepare('UPDATE tblExamPermits SET printCount=:count,lastPrintedBy=:by,lastPrintedAt=NOW() WHERE permitID=:id')->execute([':count' => $count, ':by' => $in['actorEmail'], ':id' => $in['permitID']]);
+            (new ExamPermitAuditService())->writeAudit($wasReprint ? 'REPRINT' : 'PRINT', 'SUCCESS', ['permitID' => $p['permitID'], 'studentNumber' => $p['studentNumber'], 'period' => $p['period'], 'actorEmail' => $in['actorEmail'], 'detail' => $wasReprint ? ('Reprint #' . $count . '.') : 'First print.']);
+            $p['printCount'] = $count; $p['lastPrintedBy'] = $in['actorEmail'];
+            return $this->_respondContract(['ok' => true, 'permit' => $p]);
+        } catch (\Throwable $e) { return $this->_serverError($e); }
+    }
+
+    public function void()
+    {
+        try {
+            $in = $this->_json();
+            if (trim((string)($in['permitID'] ?? '')) === '' || trim((string)($in['voidReasonCode'] ?? '')) === '' || trim((string)($in['actorEmail'] ?? '')) === '') return $this->_failContract(400, 'INVALID_VOID_REASON', 'permitID, voidReasonCode and actorEmail are required.');
+            $db = Database::getConnection();
+            $s = $db->prepare("SELECT * FROM tblExamPermits WHERE permitID=:id AND status='ISSUED'"); $s->execute([':id' => $in['permitID']]); $p = $s->fetch();
+            if (!$p || $p['gateSource'] !== 'POLICY') return $this->_failContract(409, 'VOID_NOT_ALLOWED', 'Only an issued policy-sourced permit may be voided.');
+            $l = $db->prepare("SELECT label FROM ref_lookup_values WHERE category='EXAM_PERMIT_VOID_REASON' AND code=:code AND isActive=1"); $l->execute([':code' => $in['voidReasonCode']]); $label = $l->fetchColumn();
+            if (!$label) return $this->_failContract(400, 'INVALID_VOID_REASON', 'The selected void reason is invalid.');
+            if (!$this->_policyVersionChanged($p)) return $this->_failContract(409, 'VOID_NOT_ALLOWED', 'The policy has not changed since issuance.');
+            $db->prepare("UPDATE tblExamPermits SET status='VOIDED' WHERE permitID=:id")->execute([':id' => $in['permitID']]);
+            (new ExamPermitAuditService())->writeAudit('VOID', 'SUCCESS', ['permitID' => $p['permitID'], 'studentNumber' => $p['studentNumber'], 'period' => $p['period'], 'actorEmail' => $in['actorEmail'], 'detail' => ['policyID' => $p['gatePolicyID'], 'voidReason' => $label]]);
+            return $this->_respondContract(['ok' => true, 'permit' => ['permitID' => $p['permitID'], 'status' => 'VOIDED']]);
+        } catch (\Throwable $e) { return $this->_serverError($e); }
+    }
+
+    // Shared by printStatus() and void(): a policy-sourced permit's "version" is considered
+    // changed if the gate now resolves to a different policy, or the same policy was modified
+    // after this permit was generated. Watchlist-sourced permits never have a version to change.
+    private function _policyVersionChanged(array $permit): bool
+    {
+        if (($permit['gateSource'] ?? '') !== 'POLICY') return false;
+        $gate = (new ExamPermitGateService())->evaluateGate($permit['studentNumber'], $permit['academicYear'], $permit['semester'], $permit['period']);
+        if (($gate['policyID'] ?? null) !== ($permit['gatePolicyID'] ?? null)) return true;
+        if (empty($permit['gatePolicyID'])) return false;
+        $s = Database::getConnection()->prepare('SELECT lastModified FROM tblExamPermitPolicies WHERE policyID=:id');
+        $s->execute([':id' => $permit['gatePolicyID']]);
+        $lastModified = $s->fetchColumn();
+        return $lastModified && !empty($permit['generatedAt']) && strtotime($lastModified) > strtotime($permit['generatedAt']);
+    }
+
+
+    public function policies(){try{$rows=Database::getConnection()->query('SELECT * FROM tblExamPermitPolicies ORDER BY priorityOrder DESC, policyID')->fetchAll();foreach($rows as &$r){$r['appliesToPeriods']=$r['appliesToPeriods']?explode(',',$r['appliesToPeriods']):[];$r['scope']=['scopeType'=>$r['scopeType'],'studentNumber'=>$r['studentNumber'],'programID'=>$r['programID'],'yearLevel'=>$r['yearLevel'],'classCode'=>$r['classCode'],'priorityOrder'=>(int)$r['priorityOrder']];}return $this->_respondContract(['ok'=>true,'policies'=>$rows]);}catch(\Throwable $e){$this->_serverError($e);}}
+    public function policiesSave(){try{$in=$this->_json();foreach(['policyName','scope','actorEmail'] as $f)if(empty($in[$f]))return $this->_validationError($f.' is required.');$id=(new ExamPermitPolicyService())->save($in);(new ExamPermitAuditService())->writeAudit(empty($in['policyID'])?'POLICY_CREATE':'POLICY_UPDATE','SUCCESS',['permitID'=>$id,'actorEmail'=>$in['actorEmail'],'detail'=>$in['policyName']]);return $this->_respondContract(['ok'=>true,'policyID'=>$id,'message'=>'Policy saved.']);}catch(\InvalidArgumentException $e){return $this->_failContract(400,'RULE_TYPE_NOT_IMPLEMENTED',$e->getMessage());}catch(\Throwable $e){$this->_serverError($e);}}
+    public function policiesEnable(){try{$in=$this->_json();$db=Database::getConnection();$s=$db->prepare('UPDATE tblExamPermitPolicies SET isEnabled=:enabled,modifiedBy=:by,lastModified=NOW() WHERE policyID=:id');$s->execute([':enabled'=>!empty($in['isEnabled'])?1:0,':by'=>$in['actorEmail']??null,':id'=>$in['policyID']??'']);if(!$s->rowCount())return $this->_failContract(404,'NOT_FOUND','Policy not found.');(new ExamPermitAuditService())->writeAudit(!empty($in['isEnabled'])?'POLICY_ENABLE':'POLICY_DISABLE','SUCCESS',['actorEmail'=>$in['actorEmail']??null,'detail'=>$in['policyID']]);return $this->_respondContract(['ok'=>true]);}catch(\Throwable $e){$this->_serverError($e);}}
+    public function policyAdminBootstrap(){try{$in=$_GET;$term=(new ExamPermitReferenceDataService())->getActiveTerm();$ay=$term['academicYear'];$sem=$term['semester'];$students=(new ExamPermitReferenceDataService())->getTermStudentRoster($ay,$sem);$programs=(new ReferenceDataService())->getAllPrograms();$fees=(new ReferenceDataService())->getActiveFees();$classes=(new ReferenceDataService())->getAllSections();$years=[];foreach($students as $s)$years[$s['yearLevel']]=true;return $this->_respondContract(['ok'=>true,'activeTerm'=>$term,'programs'=>$programs,'yearLevels'=>array_keys($years),'classes'=>array_map(fn($x)=>['classCode'=>$x['label']],$classes),'fees'=>$fees,'students'=>$students]);}catch(\Throwable $e){$this->_serverError($e);}}
+    public function policyAudit()
+    {
+        try {
+            $limit = min(200, max(1, (int)($_GET['limit'] ?? 60)));
+            $policyID = trim((string)($_GET['policyID'] ?? ''));
+            $sql = 'SELECT * FROM tblExamPermitAudit';
+            $params = [];
+            if ($policyID !== '') { $sql .= ' WHERE detail LIKE :policy'; $params[':policy'] = '%' . $policyID . '%'; }
+            $sql .= ' ORDER BY createdAt DESC LIMIT ' . $limit;
+            $s = Database::getConnection()->prepare($sql);
+            $s->execute($params);
+            return $this->_respondContract(['ok' => true, 'rows' => $s->fetchAll()]);
+        } catch (\Throwable $e) { return $this->_serverError($e); }
+    }
+    public function watchlist(){try{$in=$_GET;$entries=(new ExamPermitWatchlistService())->list($in['academicYear']??'', $in['semester']??'', $in['studentNumber']??null, $in['listType']??null, $in['status']??null);return $this->_respondContract(['ok'=>true,'entries'=>$entries]);}catch(\Throwable $e){$this->_serverError($e);}}
+    public function watchlistAdd(){try{$in=$this->_json();if(trim((string)($in['reason']??''))===''||!in_array($in['listType']??'', ['BLACKLIST','WHITELIST'],true))return $this->_validationError('A valid listType and non-empty reason are required.');$roster=(new ExamPermitReferenceDataService())->getTermStudentRoster($in['academicYear'],$in['semester']);$valid=array_filter($roster,fn($s)=>$s['studentNumber']===$in['studentNumber']);if(!$valid)return $this->_failContract(400,'INVALID_STUDENT','Student is not registered in the active term.');$id=(new ExamPermitWatchlistService())->add($in);(new ExamPermitAuditService())->writeAudit('WATCHLIST_ADD','SUCCESS',['studentNumber'=>$in['studentNumber'],'actorEmail'=>$in['actorEmail']??null,'detail'=>['listType'=>$in['listType'],'reason'=>$in['reason']]]);return $this->_respondContract(['ok'=>true,'watchlistID'=>$id]);}catch(\Throwable $e){$this->_serverError($e);}}
+    public function watchlistRemove(){try{$in=$this->_json();$ok=(new ExamPermitWatchlistService())->remove($in['watchlistID']??'', $in['actorEmail']??'');if(!$ok)return $this->_failContract(404,'NOT_FOUND','Active watchlist entry not found.');(new ExamPermitAuditService())->writeAudit('WATCHLIST_REMOVE','SUCCESS',['actorEmail'=>$in['actorEmail']??null,'detail'=>$in['watchlistID']]);return $this->_respondContract(['ok'=>true]);}catch(\Throwable $e){$this->_serverError($e);}}
+
+    private function _json(): array { return json_decode(file_get_contents('php://input'),true) ?: []; }
+    private function _respondContract(array $body): void { echo json_encode($body); }
+    private function _failContract(int $status,string $code,string $message,?string $topCode=null): void { http_response_code($status); echo json_encode(['ok'=>false,'code'=>$topCode??$code,'error'=>['code'=>$code,'message'=>$message]]); }
 
     // GET-only, no custom request headers on the client side (see
     // ep-temp.html's fetchFullPermitDetails()), so browsers treat this as
