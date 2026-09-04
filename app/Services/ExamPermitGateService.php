@@ -13,7 +13,7 @@ class ExamPermitGateService
         $watch=$this->watchlist->findActive($studentNumber,$academicYear,$semester,$period);
         if($watch) return ['decision'=>$watch['listType']==='WHITELIST'?'ALLOW':'DENY','source'=>'WATCHLIST','policyID'=>null,'watchlistID'=>$watch['watchlistID'],'reason'=>$watch['reason']];
         $policy=$this->policies->resolve($studentNumber,$academicYear,$semester,$period);
-        if(!$policy) return ['decision'=>'DENY','source'=>'POLICY','policyID'=>null,'watchlistID'=>null,'reason'=>'No applicable exam permit policy exists.'];
+        if(!$policy) return ['decision'=>'ALLOW','source'=>'POLICY','policyID'=>null,'watchlistID'=>null,'reason'=>'No applicable policy.'];
         $rules=$this->policies->evaluateRules($studentNumber,$academicYear,$semester,$policy);
         return ['decision'=>$rules['allow']?'ALLOW':'DENY','source'=>'POLICY','policyID'=>$policy['policyID'],'watchlistID'=>null,'reason'=>$rules['message']];
     }
