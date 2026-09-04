@@ -4,6 +4,7 @@ namespace App\Controllers;
 
 use App\Core\Database;
 use App\Services\ExamPermitGateService;
+use App\Services\ExamPermitAuditService;
 
 /**
  * MoodleController
@@ -750,11 +751,26 @@ class MoodleController
             $semester = isset($input['semester']) ? trim((string) $input['semester']) : '';
             $period = isset($input['period']) ? strtoupper(trim((string) $input['period'])) : '';
             $active = $input['active'] ?? null;
+            $actorEmail = isset($input['actorEmail']) ? trim((string) $input['actorEmail']) : '';
 
-            if ($email === '' || $studentNumber === '' || $academicYear === '' || $semester === '' || !isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period]) || !is_bool($active)) {
-                $this->_fail(422, 'VALIDATION_ERROR', 'email, studentNumber, academicYear, semester, a valid period (PRELIM/MIDTERM/SEMIFINALS/FINALS), and a boolean active are required.');
+            if ($email === '' || $studentNumber === '' || $academicYear === '' || $semester === '' || !isset(self::EXAM_PERMIT_FIELD_BY_PERIOD[$period]) || !is_bool($active) || $actorEmail === '') {
+                $this->_fail(422, 'VALIDATION_ERROR', 'email, studentNumber, academicYear, semester, a valid period (PRELIM/MIDTERM/SEMIFINALS/FINALS), actorEmail, and a boolean active are required.');
                 return;
             }
+
+            // This write is now audited (MOODLE_ACTIVATE / MOODLE_DEACTIVATE),
+            // matching PRINT/REPRINT/TEMP_PRINT/VOID elsewhere in the module —
+            // this closes the previous audit gap where LMS toggles never
+            // appeared in the audit trail even though the frontend's audit
+            // filter already listed these two action types.
+            $actionType = $active ? 'MOODLE_ACTIVATE' : 'MOODLE_DEACTIVATE';
+            $auditBase = [
+                'studentNumber' => $studentNumber,
+                'academicYear'  => $academicYear,
+                'semester'      => $semester,
+                'period'        => $period,
+                'actorEmail'    => $actorEmail,
+            ];
 
             // Only userId is needed to write — cheaper than
             // _resolveUserExamPermitsCore(), which also parses all four
@@ -769,12 +785,14 @@ class MoodleController
                 return;
             }
             if ($resolved['status'] === 'not_found') {
+                (new ExamPermitAuditService())->writeAudit($actionType, 'FAILED', array_merge($auditBase, ['detail' => 'USER_NOT_FOUND (' . $email . ')']));
                 $this->_respond(200, ['ok' => true, 'updated' => false, 'reason' => 'USER_NOT_FOUND']);
                 return;
             }
 
             $gate = $this->_evaluateExamPermitGate($studentNumber, $academicYear, $semester, $period);
             if ($gate['status'] !== 'ok') {
+                (new ExamPermitAuditService())->writeAudit($actionType, 'DENY', array_merge($auditBase, ['permitID' => $gate['permitID'] ?? null, 'detail' => $gate['message']]));
                 $this->_respond(200, [
                     'ok'      => true,
                     'updated' => false,
@@ -789,12 +807,18 @@ class MoodleController
             switch ($update['status']) {
                 case 'invalid_period': // defensive only — already validated above
                 case 'invalid':
+                    (new ExamPermitAuditService())->writeAudit($actionType, 'FAILED', array_merge($auditBase, ['permitID' => $gate['permitID'] ?? null, 'detail' => $update['message']]));
                     $this->_fail(422, 'EXAM_PERMIT_UPDATE_INVALID', $update['message']);
                     return;
                 case 'forbidden':
+                    (new ExamPermitAuditService())->writeAudit($actionType, 'FAILED', array_merge($auditBase, ['permitID' => $gate['permitID'] ?? null, 'detail' => $update['message']]));
                     $this->_fail(502, 'MOODLE_FORBIDDEN', $update['message']);
                     return;
                 case 'timeout':
+                    // Transport-level failures are not written to the audit
+                    // trail — same convention as PRINT/TEMP_PRINT, which also
+                    // only ever audit a definite SUCCESS/FAILED/DENY outcome,
+                    // not "we couldn't tell".
                     $this->_fail(504, 'MOODLE_TIMEOUT', $update['message']);
                     return;
                 case 'unavailable':
@@ -802,6 +826,10 @@ class MoodleController
                     return;
                 case 'ok':
                 default:
+                    (new ExamPermitAuditService())->writeAudit($actionType, 'SUCCESS', array_merge($auditBase, [
+                        'permitID' => $gate['permitID'] ?? null,
+                        'detail'   => $period . ' Moodle Exam Permit set to ' . ($active ? 'active' : 'inactive') . '.',
+                    ]));
                     $this->_respond(200, [
                         'ok'      => true,
                         'updated' => true,
@@ -832,13 +860,14 @@ class MoodleController
         try {
             $db = Database::getConnection();
             $stmt = $db->prepare(
-                "SELECT 1
+                "SELECT permitID
                  FROM tblExamPermits
                  WHERE studentNumber = :studentNumber
                    AND academicYear = :academicYear
                    AND semester = :semester
                    AND period = :period
                    AND status = 'ISSUED'
+                 ORDER BY generatedAt DESC, permitID DESC
                  LIMIT 1"
             );
             $stmt->execute([
@@ -848,20 +877,27 @@ class MoodleController
                 ':period'        => $period,
             ]);
 
-            if ($stmt->fetchColumn() === false) {
+            $permitID = $stmt->fetchColumn();
+            if ($permitID === false) {
                 return [
-                    'status'  => 'ineligible',
-                    'message' => 'No issued Exam Permit exists for this student in the current academic year/semester and period.',
+                    'status'   => 'ineligible',
+                    'permitID' => null,
+                    'message'  => 'No issued Exam Permit exists for this student in the current academic year/semester and period.',
                 ];
             }
 
-            return ['status' => 'ok'];
+            // permitID travels back up to updateExamPermitStatusByEmail() so
+            // its MOODLE_ACTIVATE/MOODLE_DEACTIVATE audit rows can link back
+            // to the specific permit — same convention PRINT/VOID already
+            // use for their own audit rows.
+            return ['status' => 'ok', 'permitID' => $permitID];
         } catch (\Throwable $e) {
             // Gate tables are not yet present in this install; fail closed so a
             // toggle never reaches Moodle without a valid permit state.
             return [
-                'status'  => 'ineligible',
-                'message' => 'Exam Permit gating is not available for this student/term/period.',
+                'status'   => 'ineligible',
+                'permitID' => null,
+                'message'  => 'Exam Permit gating is not available for this student/term/period.',
             ];
         }
     }

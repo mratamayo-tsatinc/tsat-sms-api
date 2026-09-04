@@ -268,6 +268,114 @@ class ExamPermitController
     }
 
     /**
+     * GET /api/exam-permit/latest-issued-all?studentNumber=...&academicYear=...&semester=...
+     * { ok:true, permits: { PRELIM: {...}|null, MIDTERM:..., SEMIFINALS:..., FINALS:... } }
+     *
+     * All-four-periods sibling of latestIssued() — the latest permit row
+     * (any status: ISSUED or VOIDED) per period for ONE student, in a
+     * single query. Powers the drawer header's always-visible 4-badge
+     * strip (see exampermit.html renderPermitBadges()).
+     */
+    public function latestIssuedAll()
+    {
+        try {
+            $studentNumber = trim((string)($_GET['studentNumber'] ?? ''));
+            $academicYear  = trim((string)($_GET['academicYear'] ?? ''));
+            $semester      = trim((string)($_GET['semester'] ?? ''));
+
+            if ($studentNumber === '' || $academicYear === '' || $semester === '') {
+                $this->_validationError('studentNumber, academicYear, and semester are required.');
+                return;
+            }
+
+            $results = $this->_fetchLatestIssuedAllForStudents([$studentNumber], $academicYear, $semester);
+            echo json_encode(['ok' => true, 'permits' => $results[$studentNumber]]);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * POST /api/exam-permit/latest-issued/bulk
+     * Body: { studentNumbers: string[], academicYear, semester }
+     * { ok:true, results: { <studentNumber>: {PRELIM:{...}|null, MIDTERM:..., SEMIFINALS:..., FINALS:...} } }
+     *
+     * Roster-wide sibling of latestIssuedAll() — one query covers every
+     * requested student's latest permit row per period, same "bulk instead
+     * of N single calls" pattern as MoodleController::examPermitStatusByEmails().
+     * Powers the student-list row badges across the whole roster; the
+     * frontend chunks/concurrency-limits this exactly like the existing
+     * exam-permit-status/bulk Moodle call.
+     */
+    public function latestIssuedAllBulk()
+    {
+        try {
+            $in = $this->_json();
+            $studentNumbers = is_array($in['studentNumbers'] ?? null) ? $in['studentNumbers'] : [];
+            $academicYear = trim((string)($in['academicYear'] ?? ''));
+            $semester = trim((string)($in['semester'] ?? ''));
+
+            $studentNumbers = array_values(array_unique(array_filter(array_map(
+                function ($s) { return is_string($s) || is_numeric($s) ? trim((string)$s) : ''; },
+                $studentNumbers
+            ), function ($s) { return $s !== ''; })));
+
+            if (empty($studentNumbers) || $academicYear === '' || $semester === '') {
+                $this->_validationError('studentNumbers (non-empty array), academicYear, and semester are required.');
+                return;
+            }
+
+            $results = $this->_fetchLatestIssuedAllForStudents($studentNumbers, $academicYear, $semester);
+            echo json_encode(['ok' => true, 'results' => $results]);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
+    /**
+     * Shared core for latestIssuedAll() (one student) and
+     * latestIssuedAllBulk() (many) — one query, ordered so the first row
+     * seen per studentNumber+period is already the latest (generatedAt
+     * DESC, permitID DESC), deduped in PHP rather than with a correlated
+     * subquery per period. Every requested student is guaranteed all four
+     * period keys in the return, even when no permit row exists yet for
+     * that period (null), so callers never need to special-case a missing
+     * key.
+     *
+     * @return array<string,array{PRELIM:?array,MIDTERM:?array,SEMIFINALS:?array,FINALS:?array}>
+     */
+    private function _fetchLatestIssuedAllForStudents(array $studentNumbers, string $academicYear, string $semester): array
+    {
+        $out = [];
+        foreach ($studentNumbers as $sn) {
+            $out[$sn] = ['PRELIM' => null, 'MIDTERM' => null, 'SEMIFINALS' => null, 'FINALS' => null];
+        }
+        if (empty($studentNumbers)) return $out;
+
+        $db = Database::getConnection();
+        $placeholders = implode(',', array_fill(0, count($studentNumbers), '?'));
+        $sql = "SELECT * FROM tblExamPermits
+                WHERE studentNumber IN ($placeholders) AND academicYear = ? AND semester = ?
+                ORDER BY studentNumber, period, generatedAt DESC, permitID DESC";
+        $stmt = $db->prepare($sql);
+        $stmt->execute(array_merge($studentNumbers, [$academicYear, $semester]));
+
+        $seen = []; // "studentNumber|period" -> true, keeps only the first (latest) row per pair
+        while ($row = $stmt->fetch()) {
+            $key = $row['studentNumber'] . '|' . $row['period'];
+            if (isset($seen[$key])) continue;
+            $seen[$key] = true;
+            if (!isset($out[$row['studentNumber']])) {
+                $out[$row['studentNumber']] = ['PRELIM' => null, 'MIDTERM' => null, 'SEMIFINALS' => null, 'FINALS' => null];
+            }
+            if (array_key_exists($row['period'], $out[$row['studentNumber']])) {
+                $out[$row['studentNumber']][$row['period']] = $row;
+            }
+        }
+        return $out;
+    }
+
+    /**
      * GET /api/exam-permit/moodle-eligibility?studentNumber=...&academicYear=...&semester=...&period=...
      * This is the same gate precondition used by the Moodle write endpoint. Since this install
      * does not yet include the full policy/watchlist tables from the later phase, the check resolves

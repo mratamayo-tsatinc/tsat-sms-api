@@ -55,6 +55,9 @@ return [
         // Exam Permit — read-only contract endpoints used by the officer UI.
         'api/exam-permit/lookup-values'     => [\App\Controllers\ExamPermit\ExamPermitController::class, 'lookupValues'],
         'api/exam-permit/latest-issued'      => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssued'],
+        // All-four-periods sibling of latest-issued, for one student — powers
+        // the drawer header's always-visible per-period badge strip.
+        'api/exam-permit/latest-issued-all'  => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssuedAll'],
         'api/exam-permit/gate-preview'       => [\App\Controllers\ExamPermit\ExamPermitController::class, 'gatePreview'],
         'api/exam-permit/moodle-eligibility' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'moodleEligibility'],
         'api/exam-permit/policies' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policies'],
@@ -243,6 +246,12 @@ return [
         // roster's worth of emails without risking a URL length limit —
         // this does not write anything.
         'api/moodle/users/exam-permit-status/bulk' => [\App\Controllers\MoodleController::class, 'examPermitStatusByEmails'],
+
+        // Roster-wide sibling of latest-issued-all — one call resolves every
+        // period's latest permit row for many students at once, chunked on
+        // the frontend the same way as the bulk Moodle call directly above.
+        // Powers the student-list row badges.
+        'api/exam-permit/latest-issued/bulk' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'latestIssuedAllBulk'],
 		
         'api/import'                 => [\App\Controllers\ImportController::class,       'handle'],
  
