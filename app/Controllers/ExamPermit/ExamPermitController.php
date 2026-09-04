@@ -328,6 +328,37 @@ class ExamPermitController
         } catch (\Throwable $e) { return $this->_serverError($e); }
     }
 
+    /**
+     * POST /api/exam-permit/temp-print-status
+     * Twin of printStatus() for the 80mm thermal Temporary Permit: same
+     * permit row, same POLICY_VERSION_CHANGED guard, but its own counter
+     * (tempPrintCount / lastTempPrintedBy / lastTempPrintedAt) and its own
+     * audit actionType (TEMP_PRINT / TEMP_REPRINT) so the two print
+     * formats are distinguishable in the audit log and never share a
+     * count. Does not touch printCount/lastPrintedBy/lastPrintedAt —
+     * those remain exclusively the wide-format permit's counters.
+     */
+    public function tempPrintStatus()
+    {
+        try {
+            $in = $this->_json();
+            if (trim((string)($in['permitID'] ?? '')) === '' || trim((string)($in['actorEmail'] ?? '')) === '') return $this->_validationError('permitID and actorEmail are required.');
+            $db = Database::getConnection();
+            $s = $db->prepare('SELECT * FROM tblExamPermits WHERE permitID=:id'); $s->execute([':id' => $in['permitID']]); $p = $s->fetch();
+            if (!$p) return $this->_failContract(404, 'NOT_FOUND', 'Permit not found.');
+            $wasReprint = (int)$p['tempPrintCount'] > 0;
+            if ($this->_policyVersionChanged($p)) {
+                (new ExamPermitAuditService())->writeAudit($wasReprint ? 'TEMP_REPRINT' : 'TEMP_PRINT', 'FAILED', ['permitID' => $p['permitID'], 'studentNumber' => $p['studentNumber'], 'period' => $p['period'], 'actorEmail' => $in['actorEmail'], 'detail' => 'POLICY_VERSION_CHANGED']);
+                return $this->_failContract(200, 'POLICY_VERSION_CHANGED', 'The policy used to generate this permit has changed. Void and reissue instead of reprinting.', 'POLICY_VERSION_CHANGED');
+            }
+            $count = (int)$p['tempPrintCount'] + 1;
+            $db->prepare('UPDATE tblExamPermits SET tempPrintCount=:count,lastTempPrintedBy=:by,lastTempPrintedAt=NOW() WHERE permitID=:id')->execute([':count' => $count, ':by' => $in['actorEmail'], ':id' => $in['permitID']]);
+            (new ExamPermitAuditService())->writeAudit($wasReprint ? 'TEMP_REPRINT' : 'TEMP_PRINT', 'SUCCESS', ['permitID' => $p['permitID'], 'studentNumber' => $p['studentNumber'], 'period' => $p['period'], 'actorEmail' => $in['actorEmail'], 'detail' => $wasReprint ? ('Temp reprint #' . $count . '.') : 'First temp print.']);
+            $p['tempPrintCount'] = $count; $p['lastTempPrintedBy'] = $in['actorEmail'];
+            return $this->_respondContract(['ok' => true, 'permit' => $p]);
+        } catch (\Throwable $e) { return $this->_serverError($e); }
+    }
+
     public function void()
     {
         try {

@@ -229,6 +229,7 @@ return [
 
         'api/exam-permit/generate' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'generate'],
         'api/exam-permit/print-status' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'printStatus'],
+        'api/exam-permit/temp-print-status' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'tempPrintStatus'],
         'api/exam-permit/void' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'void'],
         'api/exam-permit/policies/save' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policiesSave'],
         'api/exam-permit/policies/enable' => [\App\Controllers\ExamPermit\ExamPermitController::class, 'policiesEnable'],
