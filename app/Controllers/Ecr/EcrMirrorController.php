@@ -326,6 +326,35 @@ class EcrMirrorController
         }
     }
 
+    /**
+     * POST /api/ecr/mirror/files/reset
+     * Body: { teacherClassLoadID, resetBy }
+     *
+     * Called by Ecr.gs's resetOfferingEcrFile() AFTER the old ECR file has
+     * already been archived (renamed + moved into "_Archived") — this
+     * endpoint never touches Drive, it only clears this offering's mirror
+     * state. See EcrMirrorService::resetOfferingEcrState()'s docblock for
+     * the no-delete-contract exception this makes.
+     */
+    public function resetFile()
+    {
+        try {
+            $body = $this->_readJsonBody();
+
+            $teacherClassLoadID = trim((string)($body['teacherClassLoadID'] ?? ''));
+            if ($teacherClassLoadID === '') {
+                $this->_validationError('teacherClassLoadID is required.', ['teacherClassLoadID' => 'Required.']);
+                return;
+            }
+
+            (new EcrMirrorService())->resetOfferingEcrState($teacherClassLoadID, $body['resetBy'] ?? null);
+
+            echo json_encode(['ok' => true, 'message' => 'ECR file state reset.']);
+        } catch (\Throwable $e) {
+            $this->_serverError($e);
+        }
+    }
+
  	// ═══════════════════════════════════════════════════════════════
     // Roster mirror (Phase 6). No override endpoints — roster rows are
     // never manually corrected the way a folder/file ID is; a wrong
