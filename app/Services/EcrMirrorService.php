@@ -242,6 +242,62 @@ class EcrMirrorService
         }
     }
 
+    /**
+     * Resets one offering's ECR state — the server-side half of the
+     * "Reset ECR file" archive-and-replace flow (Ecr.gs::resetOfferingEcrFile()).
+     * By the time this is called, the old Drive file has ALREADY been
+     * renamed and moved into the teacher's "_Archived" subfolder — this
+     * method never touches Drive, it only clears the mirror rows that
+     * described the now-archived file, so the next createEcrFile() +
+     * roster/attendance sync starts from a genuinely blank slate.
+     *
+     * Deliberate, one-time exception to tblEcrRosterMirror's and
+     * tblEcrAttendanceMeetings/Summary's normal no-delete/latest-snapshot
+     * contract (see this class's and EcrAttendanceMirrorService's class
+     * docblocks): a reset means "this offering's ECR life starts over" —
+     * leaving the old file's roster/attendance rows in place would let a
+     * stale snapshot outlive the file it was read from and resurface once
+     * the NEW file gets its own first sync.
+     *
+     * $teacherClassLoadID is trusted as already-validated by the controller.
+     */
+    public function resetOfferingEcrState(string $teacherClassLoadID, ?string $resetBy): void
+    {
+        $db = Database::getConnection();
+        $ownsTransaction = !$db->inTransaction();
+        if ($ownsTransaction) $db->beginTransaction();
+
+        try {
+            // File mirror -> back to blank defaults. upsertFile() already
+            // handles "no existing row yet" correctly (INSERT ... ON
+            // DUPLICATE KEY UPDATE), so this is safe even for an offering
+            // that was never previously synced.
+            $this->upsertFile([
+                'teacherClassLoadID' => $teacherClassLoadID,
+                'fileID'             => null,
+                'fileExists'         => false,
+                'isShared'           => false,
+                'level'              => null,
+                'isManualOverride'   => false,
+                'syncedBy'           => $resetBy,
+            ]);
+
+            $delRoster = $db->prepare("DELETE FROM tblEcrRosterMirror WHERE teacherClassLoadID = :tcl");
+            $delRoster->execute([':tcl' => $teacherClassLoadID]);
+
+            $delMeetings = $db->prepare("DELETE FROM tblEcrAttendanceMeetings WHERE teacherClassLoadID = :tcl");
+            $delMeetings->execute([':tcl' => $teacherClassLoadID]);
+
+            $delSummary = $db->prepare("DELETE FROM tblEcrAttendanceSummary WHERE teacherClassLoadID = :tcl");
+            $delSummary->execute([':tcl' => $teacherClassLoadID]);
+
+            if ($ownsTransaction) $db->commit();
+        } catch (\Throwable $e) {
+            if ($ownsTransaction && $db->inTransaction()) $db->rollBack();
+            throw $e;
+        }
+    }
+
 	// -----------------------------------------------------------------
     // Roster mirror (Phase 6)
     // -----------------------------------------------------------------

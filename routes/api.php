@@ -316,6 +316,10 @@ return [
 		'api/ecr/mirror/files/sync'                => [\App\Controllers\Ecr\EcrMirrorController::class, 'syncFile'],
 		'api/ecr/mirror/files/sync-bulk'           => [\App\Controllers\Ecr\EcrMirrorController::class, 'syncFilesBulk'],
 		'api/ecr/mirror/files/override'            => [\App\Controllers\Ecr\EcrMirrorController::class, 'overrideFile'],
+		// Archive-not-delete "Reset ECR file" — clears mirror state only;
+		// Ecr.gs's resetOfferingEcrFile() has already archived the old
+		// Drive file by the time this is called.
+		'api/ecr/mirror/files/reset'                => [\App\Controllers\Ecr\EcrMirrorController::class, 'resetFile'],
 		'api/ecr/mirror/roster/sync-bulk'          => [\App\Controllers\Ecr\EcrMirrorController::class, 'syncRosterBulk'],
 		'api/ecr/mirror/roster/upsert'             => [\App\Controllers\Ecr\EcrMirrorController::class, 'upsertRosterRow'],
 		'api/ecr/mirror/roster/upsert-bulk'        => [\App\Controllers\Ecr\EcrMirrorController::class, 'upsertRosterRowsBulk'],
